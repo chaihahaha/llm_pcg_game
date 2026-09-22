@@ -301,11 +301,24 @@ class WorldManager:
                                   solid=_OBJ_SOLID.get(kind, 0), tick=tick)
 
         for n in data.get("npcs", []):
+            name = self._unique_npc_name(str(n.get("name", "无名者")))
             self.store.add_npc(
                 self.world_id, ox + int(n["x"]), oy + int(n["y"]),
-                str(n.get("name", "无名者")), race=str(n.get("race", "")), role=str(n.get("role", "")),
+                name, race=str(n.get("race", "")), role=str(n.get("role", "")),
                 personality=str(n.get("personality", "")), tick=tick,
             )
+
+    def _unique_npc_name(self, name: str) -> str:
+        """Names are how the player and the engine address NPCs, so they must be
+        unique — separate chunks can otherwise invent the same person twice."""
+        name = name.strip()[:20] or "无名者"
+        if not self.store.find_npc_by_name(self.world_id, name):
+            return name
+        for i in range(2, 32):
+            candidate = f"{name}·{i}"
+            if not self.store.find_npc_by_name(self.world_id, candidate):
+                return candidate
+        return f"{name}·{self.store.count_npcs(self.world_id)}"
 
     # ------------------------------------------------------------------- tiles
     def tile_at(self, x: int, y: int) -> dict:

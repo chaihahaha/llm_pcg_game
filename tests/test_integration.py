@@ -77,6 +77,13 @@ class TestLODTree(unittest.TestCase):
         self.assertEqual(t1["desc"], t2["desc"])
         self.assertIn("detail", t2["data"])
 
+    def test_npc_names_are_unique_across_chunks(self):
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        self.wm.ensure_node(LOD_CHUNK, 64, 64)
+        names = [n["name"] for n in
+                 self.store.npcs_near(self.wm.world_id, 32, 32, 200, limit=200)]
+        self.assertEqual(len(names), len(set(names)))
+
     def test_terrain_stays_in_vocabulary(self):
         from pcg.terrain import TERRAIN
         for t in self.store.list_tiles(self.wm.world_id, 0, 0, 15, 15):
