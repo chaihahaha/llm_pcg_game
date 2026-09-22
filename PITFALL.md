@@ -62,7 +62,53 @@
 **现象**：`auto` 探索出现"实际移动 0 格"。
 **修复**：`WorldManager.find_spawn` 螺旋搜索一个可通行且**至少两个正交方向可走**的格子。
 
-## 10. 测试输出污染 unittest 结果
+## 10. Mock 与真实模型的缓存互相污染
+
+**现象**：跑完单测后启动真实模型，世界瞬间"生成"完毕，但内容全是 Mock 的；
+`worlds` 表 0 行、缓存里 11 条记录时间戳几乎相同。
+**原因**：缓存 key 只含 messages/task/tokens/temperature，**不含后端身份**；
+单测用 Mock 后端写进同一个 `data/llm_cache.db`，真实运行直接命中。
+**修复**：
+* `LLMClient._key` 加入 `backend_name` 与 `model_name`。
+* 测试用 `test_cfg()` 把 `llm.cache_path` 指到 `data/test_llm_cache.db`，与生产缓存隔离。
+
+## 11. 缓存放在存档库里，删档即失忆
+
+**现象**：删除 `world.db` 重开世界，所有 LLM 调用（每次约 45 s）全部重跑。
+**修复**：把缓存拆到独立的 `CacheStore`（默认 `data/llm_cache.db`），
+与存档解耦；重开世界/重跑测试都零成本。
+
+## 12. zsh 下 `rm -f a*` 遇到无匹配会让整条命令中止
+
+**现象**：`rm -f data/llm_cache.db data/test_*.db*` 中后一个 glob 无匹配，
+zsh 报 `no matches found` 并**中止整行**，结果前面的文件也没删掉。
+**原因**：zsh 默认 `nomatch` 行为（bash 会保留字面量）。
+**修复**：逐个写明确路径，或对 glob 加引号、用 `setopt NULL_GLOB`。
+
+## 13. 模型键名漂移：`name` / `world_name` / `area_name`
+
+**现象**：同一提示词，模型这次返回 `name`，下次返回 `world_name`、`region_name`、`area_name`，
+导致世界名落到默认值"无名之地"。
+**修复**：`world.py::_field` 先按显式别名匹配，再按 `_<key>` 后缀匹配
+（找 `name` 时 `area_name` 也命中），比重新生成一次（45 s）便宜得多。
+
+## 14. 让模型输出 256 个字符几乎必然退化
+
+**现象**：要求 16 行 × 16 字符的地形矩阵，模型稳定产出 `=.=.=.=`、`mm..mm..`、
+整行同一个字符等退化结果。
+**原因**：长且要求"逐字符精确"的字段，在小量化模型 + JSON 语法约束下极易自我复制。
+**修复**：改让模型输出 **3-6 个地形矩形**（`patches`），服务端栅格化并用确定性噪声补空。
+模型表达"哪里有湖/林/废墟"很擅长，且省下大量 token 与时间。
+仍保留对 `rows` 的兼容与合法性/多样性校验（`_rows_are_sane`）。
+
+## 15. JSON 键里带空格：`{"  name": ...}`
+
+**现象**：区域名/地名落到默认值，检查缓存发现键是 `"  name"`（两个前导空格）。
+**原因**：模型在键名前后输出了空白。
+**修复**：`parse_json_loose` 解析成功后递归 `_clean_keys` 去掉所有对象键的首尾空白；
+`world._field` 再做别名 + 后缀匹配。
+
+## 16. 测试输出污染 unittest 结果
 
 **现象**：REPL 里的 `print` 混进测试输出。
 **修复**：测试中用 `contextlib.redirect_stdout(io.StringIO())` 包住 `game.execute`。

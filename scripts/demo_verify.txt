@@ -1,0 +1,5 @@
+# 快速验证：名称/结构容错（全部命中缓存）
+world
+look
+inspect
+stats

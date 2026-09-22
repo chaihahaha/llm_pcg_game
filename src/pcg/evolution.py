@@ -87,31 +87,46 @@ class EvolutionEngine:
         return produced
 
     def _due_scopes(self, tick: int, px: int, py: int) -> List[Tuple[int, dict]]:
-        """Ordered by relevance: nearest chunk first, then the ancestor chain."""
-        out: List[Tuple[int, dict]] = []
+        """Scopes to evolve this advance, coarsest LOD first.
+
+        Ordering matters: the world/region/zone steps of *this* advance must be
+        applied before the local chunk step, because the chunk prompt consumes
+        the higher-LOD events as its "higher digest".  A reserved local budget
+        guarantees the coarse levels can never starve tile-level detail.
+        """
+        chunks: List[dict] = []
         cs = self.wm.chunk_size
         r = int(cfg_get(self.cfg, "evolution.neighbor_radius", 6))
-        chunk_nodes = self.store.nodes_in_rect(self.world_id, LOD_CHUNK,
-                                               px - cs * (r + 1), py - cs * (r + 1),
-                                               px + cs * (r + 1), py + cs * (r + 1))
-        chunk_nodes.sort(key=lambda n: (abs(n["x"] - px) + abs(n["y"] - py)))
-        local_budget = int(cfg_get(self.cfg, "evolution.max_chunk_scopes_per_advance", 2))
-        used = 0
-        for node in chunk_nodes:
-            if used >= local_budget:
-                break
+        candidates = self.store.nodes_in_rect(self.world_id, LOD_CHUNK,
+                                              px - cs * (r + 1), py - cs * (r + 1),
+                                              px + cs * (r + 1), py + cs * (r + 1))
+        candidates.sort(key=lambda n: (abs(n["x"] - px) + abs(n["y"] - py)))
+        for node in candidates:
             if tick - int(node.get("updated_tick") or 0) >= self.schedule[LOD_CHUNK]:
-                out.append((LOD_CHUNK, node))
-                used += 1
-        for lod in (LOD_ZONE, LOD_REGION, LOD_WORLD):
+                chunks.append(node)
+
+        higher: List[Tuple[int, dict]] = []
+        for lod in (LOD_WORLD, LOD_REGION, LOD_ZONE):
             node = self.wm.ensure_node(lod, px, py)
             if tick - int(node.get("updated_tick") or 0) >= self.schedule[lod]:
-                out.append((lod, node))
-        # higher LOD first would starve local detail; local detail first is
-        # cheaper and more visible, so keep the order above.
-        # World/region changes are folded into local prompts as "higher digest",
-        # which is why local goes first.
-        return out
+                higher.append((lod, node))
+
+        local_budget = int(cfg_get(self.cfg, "evolution.max_chunk_scopes_per_advance", 2))
+        chosen: List[Tuple[int, dict]] = [(LOD_CHUNK, c) for c in chunks[:local_budget]]
+        remaining = max(0, self.max_calls - len(chosen))
+        for lod, node in higher:
+            if remaining <= 0:
+                break
+            chosen.append((lod, node))
+            remaining -= 1
+        for node in chunks[local_budget:]:
+            if remaining <= 0:
+                break
+            chosen.append((LOD_CHUNK, node))
+            remaining -= 1
+
+        chosen.sort(key=lambda t: t[0])  # world -> region -> zone -> chunk
+        return chosen
 
     # ---------------------------------------------------------------- scoping
     def evolve_scope(self, lod: int, node: dict, tick: int, px: int, py: int) -> List[dict]:

@@ -34,18 +34,41 @@ from .terrain import (
 )
 
 
-def _field(data: dict, *keys, default=""):
-    """First non-empty value among several plausible key spellings.
+def _present(v) -> bool:
+    return v not in (None, "", [], {})
 
-    Local models drift on key names (``world_name`` vs ``name``); being lenient
-    here is far cheaper than another 45-second regeneration.
+
+def _field(data: dict, *keys, default=""):
+    """First non-empty value matching any of ``keys``, anywhere in the object.
+
+    Local models drift on both *shape* and *names*:
+
+    * names:  ``name`` / ``world_name`` / ``region_name`` / ``area_name``
+    * shape:  ``{"zone": {"data": {"name": "灰雾铁锈回廊"}}}``
+
+    So we do a shallow breadth-first walk (parents before children, at most a
+    dozen containers) and accept exact keys plus ``_<key>`` suffixes.  Being
+    lenient is far cheaper than another 45-second regeneration.
     """
     if not isinstance(data, dict):
         return default
-    for k in keys:
-        v = data.get(k)
-        if v not in (None, "", [], {}):
-            return v
+    queue = [data]
+    visited = 0
+    while queue and visited < 12:
+        cur = queue.pop(0)
+        if not isinstance(cur, dict):
+            continue
+        visited += 1
+        norm = {str(k).strip().lower(): v for k, v in cur.items() if _present(v)}
+        for k in keys:
+            if str(k).lower() in norm:
+                return norm[str(k).lower()]
+        for k in keys:
+            suffix = "_" + str(k).lower()
+            for dk, v in norm.items():
+                if dk.endswith(suffix):
+                    return v
+        queue.extend(v for v in cur.values() if isinstance(v, dict))
     return default
 
 LOD_WORLD, LOD_REGION, LOD_ZONE, LOD_CHUNK = 0, 1, 2, 3
@@ -234,7 +257,11 @@ class WorldManager:
         name = f"地块 {nx},{ny}"
         summary = str(_field(data, "summary", "overview",
                              default=f"{parent.get('name','')}的一部分"))
-        rows = self._clean_rows(data.get("rows"), seed, nx, ny, size, parent)
+        patches = _field(data, "patches", "regions", "areas", "tiles_layout", default=None)
+        if isinstance(patches, list) and patches:
+            rows = self._rows_from_patches(patches, seed, nx, ny, size, parent)
+        else:
+            rows = self._clean_rows(data.get("rows"), seed, nx, ny, size, parent)
         norm = {
             "rows": rows,
             "weather": str(data.get("weather", ""))[:20] or "晴",
@@ -340,6 +367,44 @@ class WorldManager:
                 f["x"] = hash_int(self.world_id, "fx", f["name"], mod=size)
                 f["y"] = hash_int(self.world_id, "fy", f["name"], mod=size)
         return out
+
+    def _rows_from_patches(self, patches, seed: int, nx: int, ny: int, size: int,
+                           parent: dict) -> List[str]:
+        """Rasterise LLM-chosen terrain rectangles, filling gaps procedurally.
+
+        Asking a 27B model for 256 exact characters degenerates almost every
+        time; asking it for 3-6 rectangles it can reliably do, and rectangles
+        are a much better expression of "there is a lake here, a ruin there".
+        """
+        mix = normalize_mix((parent.get("data") or {}).get("biome_mix"))
+        grid: List[List[str]] = [[None] * size for _ in range(size)]  # type: ignore
+        applied = 0
+        for p in patches[:8]:
+            if not isinstance(p, dict):
+                continue
+            terr = normalize(str(_field(p, "terrain", "biome", "kind", default="")))
+            try:
+                x, y = int(p.get("x", 0)), int(p.get("y", 0))
+                w, h = int(p.get("w", 0)), int(p.get("h", 0))
+            except (TypeError, ValueError):
+                continue
+            if w <= 0 or h <= 0:
+                continue
+            for j in range(max(0, y), min(size, y + h)):
+                for i in range(max(0, x), min(size, x + w)):
+                    grid[j][i] = symbol_of(terr)
+            applied += 1
+        if applied == 0:
+            return [self._procedural_row(seed, nx, ny, j, size, mix) for j in range(size)]
+        covered = sum(1 for row in grid for c in row if c is not None)
+        if self.logger and covered < size * size * 0.4:
+            self.logger.warning("chunk %s,%s patches cover only %.0f%% -> procedural fill",
+                                nx, ny, 100.0 * covered / (size * size))
+        for j in range(size):
+            for i in range(size):
+                if grid[j][i] is None:
+                    grid[j][i] = self._procedural_cell(seed, nx + i, ny + j, mix)
+        return ["".join(row) for row in grid]
 
     def _clean_rows(self, raw, seed: int, nx: int, ny: int, size: int, parent: dict) -> List[str]:
         """Validate the code matrix; strip junk, pad/repair, or regenerate.

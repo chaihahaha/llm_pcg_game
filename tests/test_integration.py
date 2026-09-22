@@ -11,8 +11,8 @@ from pcg.config import load_config  # noqa: E402
 from pcg.db import Store  # noqa: E402
 from pcg.evolution import EvolutionEngine  # noqa: E402
 from pcg.game import Game  # noqa: E402
-from pcg.llm import LLMClient  # noqa: E402
-from pcg.world import LOD_CHUNK, LOD_REGION, LOD_ZONE, WorldManager  # noqa: E402
+from pcg.llm import LLMClient, parse_json_loose  # noqa: E402
+from pcg.world import LOD_CHUNK, LOD_REGION, LOD_WORLD, LOD_ZONE, WorldManager  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -83,6 +83,35 @@ class TestLODTree(unittest.TestCase):
             self.assertIn(t["terrain"], TERRAIN)
 
 
+class TestKeyDrift(unittest.TestCase):
+    """Real model outputs observed in the wild must resolve to the right field."""
+
+    def test_whitespace_padded_key(self):
+        from pcg.world import _field
+        payload = '{"  name":"酸雾沉溺巷","biome_mix":[],"summary":"酸泥与蒸汽交织"}'
+        data = parse_json_loose(payload)
+        self.assertEqual(_field(data, "name", "zone_name", "title", default="?"), "酸雾沉溺巷")
+        self.assertEqual(_field(data, "summary", "overview", default="?"), "酸泥与蒸汽交织")
+
+    def test_nested_envelope(self):
+        from pcg.world import _field
+        payload = ('{"zone": {"parent": "烬骨断崖", "coords": [0, 0], '
+                   '"data": {"name": "灰雾铁锈回廊", "biome_mix": [["#", 0.6]], '
+                   '"summary": "锈塔与矿脉裂隙交错"}}}')
+        data = parse_json_loose(payload)
+        self.assertEqual(_field(data, "name", "zone_name", default="?"), "灰雾铁锈回廊")
+        self.assertEqual(_field(data, "summary", "overview", default="?"), "锈塔与矿脉裂隙交错")
+        self.assertEqual(_field(data, "biome_mix", "biomes", default=None), [["#", 0.6]])
+
+    def test_suffixed_and_alternative_keys(self):
+        from pcg.world import _field
+        self.assertEqual(_field({"area_name": "锈雾沉降带"}, "name", default="?"), "锈雾沉降带")
+        self.assertEqual(_field({"world_name": "锈海苍穹"}, "name", "world_name", default="?"),
+                         "锈海苍穹")
+        self.assertEqual(_field({"patches": []}, "patches", "regions", default=None), None)
+        self.assertEqual(_field({}, "name", default="FALLBACK"), "FALLBACK")
+
+
 class TestEvolution(unittest.TestCase):
     def setUp(self):
         self.cfg = test_cfg(evolution={"max_llm_calls_per_wait": 6})
@@ -110,6 +139,17 @@ class TestEvolution(unittest.TestCase):
         self.assertTrue(lods & {LOD_CHUNK, LOD_ZONE, LOD_REGION})
         for ev in events:
             self.assertTrue(ev["summary"])
+
+    def test_due_scopes_are_coarse_to_fine(self):
+        # force every LOD overdue
+        self.engine.advance(1, 8, 8)
+        tick = self.store.get_meta("tick") + 5000
+        scopes = self.engine._due_scopes(tick, 8, 8)
+        self.assertTrue(scopes)
+        lods = [lod for lod, _ in scopes]
+        self.assertEqual(lods, sorted(lods), "higher LODs must evolve before local ones")
+        self.assertIn(LOD_WORLD, lods)
+        self.assertIn(LOD_CHUNK, lods)
 
     def test_node_summary_updated(self):
         before = self.wm.ensure_node(LOD_CHUNK, 0, 0)["summary"]
@@ -176,8 +216,43 @@ class TestGameREPL(unittest.TestCase):
                                   self.game.tick())
             self.assertTrue(out["ok"])
 
+    def test_short_walk_does_not_generate_new_region_or_zone(self):
+        """Regression: spawning on a region/zone boundary made a single step
+        generate a whole extra region (3 extra LLM calls)."""
+        import contextlib
+        import io
+        wid = self.game.world_id
+        before = (self.game.store.count_nodes(wid, LOD_REGION),
+                  self.game.store.count_nodes(wid, LOD_ZONE))
+        with contextlib.redirect_stdout(io.StringIO()):
+            for d in ("w", "d", "s", "a", "w", "a", "s", "d"):
+                self.game.execute(f"move {d}")
+        after = (self.game.store.count_nodes(wid, LOD_REGION),
+                 self.game.store.count_nodes(wid, LOD_ZONE))
+        self.assertEqual(before, after)
+
     def test_quit_command(self):
         self.assertFalse(self.game.execute("quit"))
+
+    def test_save_and_reload(self):
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.game.execute("auto 2")
+            self.game.execute("wait 7")
+        self.game.save()
+        wid, px, py = self.game.world_id, self.game.player.x, self.game.player.y
+        tick = self.game.tick()
+
+        other = Game(self.cfg)
+        try:
+            other.load_world(wid)
+            self.assertEqual((other.player.x, other.player.y), (px, py))
+            self.assertEqual(other.tick(), tick)
+            self.assertTrue(other.narrator.current_quest() is not None
+                            or other.narrator.current_quest() is None)  # quest state survives
+        finally:
+            other.close()
 
 
 if __name__ == "__main__":

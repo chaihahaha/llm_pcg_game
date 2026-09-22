@@ -1,0 +1,14 @@
+# 完整端到端演示：生成 -> 查看 -> 探索 -> 对话 -> 战斗 -> 演化 -> 任务
+world
+look
+inspect 8 8
+auto 4
+inspect
+newstory
+story
+talk 你好，这一带安全吗？
+attack
+wait 30
+journal 12
+stats
+look

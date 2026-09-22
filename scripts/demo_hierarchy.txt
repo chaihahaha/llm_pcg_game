@@ -1,0 +1,8 @@
+# 验证多 LOD 演化：一次等待跨过 chunk(6h)/zone(24h)/region(72h)/world(240h) 四个周期
+world
+inspect 8 8
+newstory
+story
+wait 250
+journal 20
+stats

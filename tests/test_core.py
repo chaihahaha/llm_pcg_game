@@ -82,6 +82,10 @@ class TestJsonLoose(unittest.TestCase):
     def test_prose_wrapped(self):
         self.assertEqual(parse_json_loose('好的：\n{"a": "b"}\n以上'), {"a": "b"})
 
+    def test_whitespace_in_keys(self):
+        self.assertEqual(parse_json_loose('{"  name": "x", "a": [{" k": 1}]}'),
+                         {"name": "x", "a": [{"k": 1}]})
+
     def test_garbage(self):
         self.assertIsNone(parse_json_loose("not json at all"))
 
@@ -161,12 +165,12 @@ class TestMockBackend(unittest.TestCase):
             self.assertEqual(finish, "stop")
             data = json.loads(raw)
             self.assertIsInstance(data, dict, task)
-        # chunk rows must be a 16-char 16-row matrix
+        # chunk map is expressed as rectangles, not a 256-char matrix
         raw, _ = be.chat(prompts.build(bible, prompts.chunk_task(1, {"name": "z", "data": {}}, 0, 0, 16)),
                          512, 0.8, True)
-        rows = json.loads(raw)["rows"]
-        self.assertEqual(len(rows), 16)
-        self.assertTrue(all(len(r) == 16 for r in rows))
+        patches = json.loads(raw)["patches"]
+        self.assertGreaterEqual(len(patches), 3)
+        self.assertTrue(all({"terrain", "x", "y", "w", "h"} <= set(p) for p in patches))
 
 
 class TestConfig(unittest.TestCase):

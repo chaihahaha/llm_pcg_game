@@ -31,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mock", action="store_true", help="强制使用确定性 Mock 后端（不访问 LLM）")
     p.add_argument("--script", type=str, default=None, help="按文件中的指令逐行执行（非交互）")
     p.add_argument("--no-story", action="store_true", help="不自动生成任务线")
+    p.add_argument("--verbose", "-v", action="store_true", help="打印每次 LLM 调用与耗时")
     return p
 
 
@@ -44,7 +45,7 @@ def main(argv=None) -> int:
         overrides["game"]["db_path"] = args.db
     cfg = load_config(args.config, overrides)
 
-    game = Game(cfg)
+    game = Game(cfg, verbose=args.verbose)
     game.auto_story = not args.no_story
     try:
         if args.new or not args.load and args.world_id is None and not _has_world(game):

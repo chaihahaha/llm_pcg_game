@@ -23,20 +23,23 @@ from .world import LOD_CHUNK, WorldManager
 _DIRS = ["w", "a", "s", "d", "n", "e", "s", "w"]
 
 
-def _setup_logger() -> logging.Logger:
+def _setup_logger(verbose: bool = False) -> logging.Logger:
     logger = logging.getLogger("pcg")
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
         logger.addHandler(handler)
+    if verbose:
+        logger.setLevel(logging.INFO)
+    elif logger.level == logging.NOTSET:
         logger.setLevel(logging.WARNING)
     return logger
 
 
 class Game:
-    def __init__(self, cfg: Dict[str, Any], logger=None):
+    def __init__(self, cfg: Dict[str, Any], logger=None, verbose: bool = False):
         self.cfg = cfg
-        self.logger = logger or _setup_logger()
+        self.logger = logger or _setup_logger(verbose)
         db_path = str(cfg_get(cfg, "game.db_path", "data/world.db"))
         self.store = Store(db_path)
         cache_path = str(cfg_get(cfg, "llm.cache_path", "data/llm_cache.db"))
@@ -171,10 +174,10 @@ class Game:
             hours = 1
             if rest:
                 try:
-                    hours = max(1, min(240, int(rest[0])))
+                    hours = max(1, min(720, int(rest[0])))
                 except ValueError:
                     pass
-            print(self._advance(hours, f"你原地等待了 {hours} 小时。"))
+            self._report_advance(hours, f"你原地等待了 {hours} 小时。")
             print(self.draw())
             return True
         if cmd == "story":
@@ -220,7 +223,7 @@ class Game:
             self._resolve_npc_turn()
             return
         self.wm.mark_explored(self.player.x, self.player.y)
-        print(self._advance(1, ""))
+        self._report_advance(1)
         print(self.draw())
         print(self.look())
 
@@ -236,7 +239,7 @@ class Game:
             print(reason)
             return
         self.wm.mark_explored(self.player.x, self.player.y)
-        print(self._advance(1, ""))
+        self._report_advance(1)
         print(self.draw())
         print(self.look())
 
@@ -304,7 +307,8 @@ class Game:
                 print(line)
         self.player.refresh()
 
-    def _advance(self, hours: int, note: str) -> str:
+    def _advance(self, hours: int, note: str = "") -> str:
+        """Move time forward; returns what is worth telling the player."""
         assert self.player is not None
         events = self.evolution.advance(hours, self.player.x, self.player.y)
         self._resolve_npc_turn()
@@ -318,7 +322,12 @@ class Game:
             q = self.narrator.maybe_new_story(self.player)
             if q:
                 lines.append(f"※ 新任务「{q['title']}」：{q.get('data', {}).get('objective', '')}")
-        return "\n".join(lines) if lines else "（时间流逝……）"
+        return "\n".join(lines)
+
+    def _report_advance(self, hours: int, note: str = "") -> None:
+        msg = self._advance(hours, note)
+        if msg:
+            print(msg)
 
     def _auto(self, steps: int) -> None:
         assert self.player is not None

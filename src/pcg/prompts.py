@@ -104,20 +104,23 @@ def zone_task(seed: int, region: Dict[str, Any], zx: int, zy: int, size: int) ->
 
 def chunk_task(seed: int, zone: Dict[str, Any], cx: int, cy: int, size: int) -> str:
     feats = "；".join(f"{f.get('name','')}" for f in (zone.get("data", {}).get("features") or [])[:3])
+    maxc = size - 1
     return (
         f"[[TASK:chunk]][[BIOME:{_dominant(zone)}]][[SEED:{seed}]]\n"
         f"父级子区域「{zone.get('name','')}」概要：{str(zone.get('summary',''))[:120]}\n"
         f"附近地名：{feats or '无'}\n"
-        f"生成其中一块 {size}x{size} 的地块（左上角世界坐标 {cx},{cy}）。输出 JSON："
+        f"生成其中一块 {size}x{size} 的地块（左上角世界坐标 {cx},{cy}）。"
+        f"用 {size}x{size} 的网格（x 向右 0-{maxc}，y 向下 0-{maxc}）描述地貌。输出 JSON："
         '{"summary":"地块概要(30-60字)","weather":"当前天气(4-10字)",'
-        f'"rows":["..TT^^......~~..","...共{size}个字符串,每个{size}字符..."],'
+        '"patches":[{"terrain":"地形名","x":0,"y":0,"w":8,"h":16},'
+        '{"terrain":"地形名","x":8,"y":0,"w":8,"h":9}],'
         '"features":[{"x":0,"y":0,"kind":"rock|ruin|plant|arcane|water|building","name":"名称","desc":"描述(15-35字)"}],'
         '"npcs":[{"x":0,"y":0,"name":"人名","race":"民族","role":"身份","personality":"性格"}]}\n'
-        f"rows 必须是恰好 {size} 个字符串，每个字符串恰好 {size} 个字符，且只能使用下列字符：\n"
-        f"{legend_text()}\n"
-        "重要：字符必须紧密相连，不要空格、逗号或任何分隔符，不要自己发明字符。示例（16 字符）：..TT^^......~~..\n"
-        "地形要与父区域一致（以主导地形为主，水/林/丘陵点缀）。"
-        f"features 2-4 个，npcs 0-2 个，坐标必须是 0-{size-1} 的整数。"
+        f"patches 为 3-6 个矩形地块，x/y 是左上角坐标(0-{maxc})，w/h 至少 2，"
+        "矩形可重叠（后面的覆盖前面的），未覆盖处会按主导地形自动填充。"
+        f"地形名只能取：{legend_text()}\n"
+        "地形要与父区域一致（以主导地形为主，水/林/丘陵点缀），避免全图单一地形。"
+        f"features 2-4 个，npcs 0-2 个，坐标必须是 0-{maxc} 的整数。"
     )
 
 

@@ -22,7 +22,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 from .config import cfg_get
-from .rng import hash_int, hash_unit, pick
+from .rng import hash_int, pick
 from .tokens import estimate_messages, estimate_tokens
 
 try:  # optional, only for nicer logs
@@ -38,6 +38,20 @@ class LLMError(RuntimeError):
 # --------------------------------------------------------------------------- json repair
 
 _FENCE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.S)
+
+
+def _clean_keys(obj: Any) -> Any:
+    """Strip whitespace that models sometimes emit inside JSON object keys.
+
+    Observed in the wild: ``{"  name": "酸雾沉溺巷"}``.  Keys are the one place
+    whitespace is never meaningful, so normalising here fixes every consumer at
+    once instead of patching each field lookup.
+    """
+    if isinstance(obj, dict):
+        return {str(k).strip(): _clean_keys(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean_keys(v) for v in obj]
+    return obj
 
 
 def parse_json_loose(text: str) -> Any:
@@ -67,7 +81,7 @@ def parse_json_loose(text: str) -> Any:
                         re.sub(r",\s*([}\]])", r"\1", cand),
                         re.sub(r",\s*([}\]])", r"\1", cand).replace("'", '"')):
             try:
-                return json.loads(attempt)
+                return _clean_keys(json.loads(attempt))
             except (ValueError, TypeError):
                 continue
     return None
@@ -129,10 +143,6 @@ class _HTTPBackend:
 
 _TERRAINS = ["grass", "tall_grass", "forest", "hill", "mountain", "water", "sand",
              "swamp", "farm", "road", "ruins", "arcane", "snow", "lava"]
-_CODES = {"water": "~", "grass": ".", "tall_grass": '"', "forest": "T", "hill": "^",
-          "mountain": "#", "sand": "s", "swamp": "m", "farm": "f", "road": "R",
-          "ruins": "+", "arcane": "%", "snow": "*", "lava": "!"}
-
 _MOCK_RACES = ["人族", "精灵", "矮人", "兽人", "龙裔", "灰烬族", "海民", "沙隐族"]
 _MOCK_ROLES = ["铁匠", "游侠", "学者", "祭司", "商贩", "卫兵", "草药师", "吟游诗人"]
 _MOCK_SURNAME = ["", "·银叶", "·铁须", "·砂歌", "·星语", "·潮生"]
@@ -239,28 +249,17 @@ class MockBackend:
 
     def _t_chunk(self, messages, seed) -> dict:
         biome = self._field(messages, "BIOME", "grass")
-        rows = []
-        for j in range(16):
-            line = ""
-            for i in range(16):
-                v = hash_unit(seed, "chunk", i, j)
-                if v < 0.08:
-                    line += _CODES["water"]
-                elif v < 0.20:
-                    line += _CODES["forest"]
-                elif v < 0.28:
-                    line += _CODES["hill"]
-                elif v < 0.32:
-                    line += _CODES["tall_grass"]
-                elif v < 0.34:
-                    line += _CODES["ruins"]
-                else:
-                    line += _CODES.get(biome, ".")
-            rows.append(line)
         return {
             "summary": "缓坡与疏林交错，可见旧石堆。",
             "weather": pick(["晴，微风", "阴，湿冷", "小雨", "薄雾", "闷热"], seed, "w"),
-            "rows": rows,
+            "patches": [
+                {"terrain": biome, "x": 0, "y": 0, "w": 16, "h": 16},
+                {"terrain": "water", "x": hash_int(seed, "p1", mod=6) + 1,
+                 "y": hash_int(seed, "p2", mod=6) + 1, "w": 5, "h": 3},
+                {"terrain": "forest", "x": hash_int(seed, "p3", mod=8) + 4,
+                 "y": hash_int(seed, "p4", mod=8) + 4, "w": 6, "h": 6},
+                {"terrain": "ruins", "x": 11, "y": 2, "w": 4, "h": 4},
+            ],
             "features": [
                 {"x": 3 + hash_int(seed, "f1", mod=10), "y": 5, "kind": "rock",
                  "name": "裂纹巨岩", "desc": "表面有细密裂纹，敲击时发出空洞回声。"},
@@ -379,8 +378,14 @@ class LLMClient:
             hit = self.store.cache_get(key)
             if hit is not None:
                 self.stats["cache_hits"] += 1
+                if self.logger:
+                    self.logger.info("llm✓ %s (cache hit)", task)
                 return hit
 
+        if self.logger:
+            self.logger.info("llm→ %s (≈%d tok in, max %d out)", task,
+                             estimate_messages(messages), max_tokens)
+        started = time.perf_counter()
         text, finish = self._invoke(messages, max_tokens, temperature, json_mode)
         # A truncated JSON object is worse than useless: spend one more call on a
         # bigger budget, but only if it actually buys us a parseable result.
@@ -395,6 +400,9 @@ class LLMClient:
         self.stats["calls"] += 1
         self.stats["prompt_tokens"] += estimate_messages(messages)
         self.stats["completion_tokens"] += estimate_tokens(text)
+        if self.logger:
+            self.logger.info("llm← %s in %.1fs (finish=%s, %d chars)", task,
+                             time.perf_counter() - started, finish or "stop", len(text or ""))
         if self.use_cache and self.store is not None and text:
             self.store.cache_put(key, task, text)
         return text
