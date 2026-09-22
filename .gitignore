@@ -1,0 +1,55 @@
+# 临时与生成物
+/tmp/
+/logs/
+/build/
+/dist/
+/cache/
+/outputs/
+/results/
+/reports/
+/envs/
+
+# 数据库 / 运行时状态
+/data/
+/state/
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+
+# 模型与大文件
+/models/
+/weights/
+/ckpts/
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.bin
+*.onnx
+*.h5
+*.pb
+*.gguf
+
+# 归档与数据
+/backups/
+/archive/
+/datasets/
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log

@@ -1,0 +1,68 @@
+# PITFALL — 踩坑记录
+
+## 1. 推理模型默认输出 thinking，吃光 max_tokens
+
+**现象**：`max_tokens=32` 时 `content` 为空，全部预算被 `reasoning_content` 占用。
+**原因**：Qwen3 系列默认开启思考，返回里 thinking 与最终答案分开。
+**修复**：所有请求带 `chat_template_kwargs: {"enable_thinking": false}`（见 `llm.py::_HTTPBackend.chat`）。
+
+## 2. `sqlite3.OperationalError: 18 values for 19 columns`
+
+**现象**：`add_npc` 插入报占位符数量不符。
+**原因**：多行字符串拼接 `VALUES(?,...,?,1,?,?,?)` 时手数占位符数错了（`alive` 用字面量 1）。
+**修复**：拆行写、显式核对；`alive` 单独用字面量，占位符 18 个对应 19 列。
+
+## 3. `hash_int()` 缺少关键字参数 `mod`
+
+**现象**：`TypeError: hash_int() missing 1 required keyword-only argument: 'mod'`。
+**原因**：`rng.hash_int(*parts, mod=...)` 的 `mod` 是 keyword-only，调用时漏了。
+**修复**：所有调用都显式传 `mod=`。
+
+## 4. 地形矩阵退化：`=.=.=.=` / `..,,..,,`
+
+**现象**：真实模型生成的 16 字符行退化为周期重复串；第一版还把图例写成 `~=water .=grass`，
+模型把 `=` 当成了地形字符。
+**原因**：(a) 图例 `sym=name` 有歧义；(b) 长重复字段在低熵采样下容易自我复制。
+**修复**：
+* 图例改为 `~ water | - shallow | . grass | ...`（符号与名称用空格分隔，配对用 `|`）。
+* 明确"字符必须紧密相连、不要分隔符"并给出示例行。
+* chunk 任务温度降到 0.65。
+* `world.py::_clean_rows` 剔除非法字符、短行用噪声补齐；
+  `_rows_are_sane` 检测退化（不同字符 < 3 或过半数行周期重复），退化则整体改用
+  父级 `biome_mix` 驱动的程序化地形。
+
+## 5. 回复被 `finish_reason=length` 截断 → JSON 解析失败
+
+**现象**：`world` 任务偶尔返回 `None`，世界名变成默认值。
+**原因**：`max_tokens` 太小，模型话没说完。
+**修复**：`LLMClient.chat` 检测 `finish_reason == "length"`，
+若 JSON 不可解析则用更大预算重试一次；`json()` 另有一轮"只输出 JSON"的修复往返。
+
+## 6. python 输出重定向到文件后看不到进度
+
+**现象**：`python3 main.py ... > log 2>&1` 后日志长时间为 0 字节。
+**原因**：stdout 被块缓冲，进程结束才 flush。
+**修复**：跑长任务用 `python3 -u`（或设 `PYTHONUNBUFFERED=1`）。
+
+## 7. macOS 没有 `timeout` 命令
+
+**现象**：`timeout 30 cmd` → `command not found: timeout`。
+**修复**：macOS 默认无 `timeout`（GNU coreutils 的 `gtimeout` 也多数未装）；
+改用 Python 内部超时参数（如 `urllib` 的 `timeout=`），或放进 tmux 后手动 `kill-session`。
+
+## 8. 只读方式读 WAL 数据库看到 0 行
+
+**现象**：`sqlite3.connect(f"file:{p}?mode=ro", uri=True)` 读正在写入的库，所有表计数为 0，
+但 `-wal` 文件已很大。
+**原因**：WAL 模式下只读连接未能加载/回放 WAL（或只看到已 checkpoint 的主库）。
+**修复**：用普通读写连接读取状态即可。
+
+## 9. 玩家可能出生在被水/山围死的格子里
+
+**现象**：`auto` 探索出现"实际移动 0 格"。
+**修复**：`WorldManager.find_spawn` 螺旋搜索一个可通行且**至少两个正交方向可走**的格子。
+
+## 10. 测试输出污染 unittest 结果
+
+**现象**：REPL 里的 `print` 混进测试输出。
+**修复**：测试中用 `contextlib.redirect_stdout(io.StringIO())` 包住 `game.execute`。

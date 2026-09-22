@@ -1,0 +1,14 @@
+# 非交互演示脚本：python main.py --new --mock --script scripts/demo.txt
+world
+look
+inspect 8 8
+move d
+move d
+inspect
+look
+wait 8
+talk 你好，这里是哪里？
+journal 10
+story
+auto 6
+stats

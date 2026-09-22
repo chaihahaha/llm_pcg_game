@@ -1,0 +1,57 @@
+{
+  "llm": {
+    "base_url": "http://127.0.0.1:8080",
+    "model": "qwen3.8_27b/Qwen3.8-27B-UD-IQ3_XXS.gguf",
+    "api_key": "sk-local",
+    "context_limit": 65536,
+    "max_tokens_out": 768,
+    "temperature": 0.85,
+    "timeout": 300,
+    "enable_thinking": false,
+    "mock": false,
+    "auto_fallback_mock": true,
+    "retries": 2,
+    "cache": true,
+    "cache_path": "data/llm_cache.db"
+  },
+  "world": {
+    "seed": 20260923,
+    "region_size": 512,
+    "zone_size": 128,
+    "chunk_size": 16,
+    "view_size": 16,
+    "max_nations": 8,
+    "max_npcs_per_chunk": 3,
+    "start_hour": 8,
+    "start_x": 8,
+    "start_y": 8
+  },
+  "evolution": {
+    "enabled": true,
+    "tick_hours": 1,
+    "schedule": {
+      "chunk": 6,
+      "zone": 48,
+      "region": 168,
+      "world": 720
+    },
+    "max_llm_calls_per_wait": 4,
+    "max_chunk_scopes_per_advance": 2,
+    "neighbor_radius": 6,
+    "max_neighbors": 12,
+    "max_local_events": 8,
+    "max_higher_events": 6
+  },
+  "context": {
+    "max_prompt_tokens": 24000,
+    "max_dialogue_turns": 6,
+    "max_event_digest": 12
+  },
+  "game": {
+    "db_path": "data/world.db",
+    "autosave": true,
+    "player_hp": 30,
+    "player_atk": 5,
+    "player_def": 2
+  }
+}

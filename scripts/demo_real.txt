@@ -1,0 +1,12 @@
+# 真实大模型（127.0.0.1:8080）演示脚本
+world
+look
+inspect 8 8
+newstory
+story
+auto 3
+inspect
+talk 你好，附近有什么值得留意的事吗？
+wait 12
+journal 10
+stats
