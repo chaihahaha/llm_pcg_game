@@ -90,6 +90,25 @@ class Game:
             raise ValueError("这个世界还没有玩家数据")
         return world
 
+    def check_backend_matches(self) -> None:
+        """Refuse to edit a save authored by a different backend.
+
+        Mock and real models produce structurally identical but semantically
+        different content, so letting them write to the same save silently
+        replaces real prose with fabricated prose.
+        """
+        if cfg_get(self.cfg, "game.allow_mixed_backend", False):
+            return
+        world = self.store.get_world(self.world_id)
+        saved = str((world.get("data") or {}).get("backend", "") or "")
+        current = self.llm.backend_name
+        if saved and saved != current:
+            raise ValueError(
+                f"存档由 {saved} 后端生成，当前是 {current} 后端。"
+                f"混用会把已有内容覆盖为另一种来源的文本。\n"
+                f"如确要如此，请加 --allow-mixed（或配置 game.allow_mixed_backend=true）。"
+            )
+
     def _wire(self) -> None:
         self.world_id = self.wm.world_id
         self.narrator = Narrator(self.store, self.llm, self.cfg, self.wm, self.logger)

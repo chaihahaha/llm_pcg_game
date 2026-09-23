@@ -105,6 +105,9 @@ class WorldManager:
             "cosmology": str(_field(data, "cosmology", "creation", "origin")),
             "magic_system": str(_field(data, "magic_system", "magic", "magic_rules")),
             "tech_baseline": str(_field(data, "tech_baseline", "tech", "technology")),
+            # which backend authored this save — mixing backends silently
+            # replaces real content with mock content, so we refuse by default
+            "backend": getattr(self.llm, "backend_name", "unknown"),
         }
         self.world_id = self.store.create_world(name, seed, era, summary, world_data)
         world_node_size = self.region_size * 8

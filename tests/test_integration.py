@@ -453,6 +453,14 @@ class TestGameREPL(unittest.TestCase):
                  self.game.store.count_nodes(wid, LOD_ZONE))
         self.assertEqual(before, after)
 
+    def test_refuses_to_mix_backends_on_one_save(self):
+        """Mock and real prose must never be written into the same world."""
+        self.game.check_backend_matches()          # mock save + mock backend: fine
+        self.game.store.update_world(self.game.world_id, data={"backend": "http"})
+        with self.assertRaises(ValueError) as ctx:
+            self.game.check_backend_matches()
+        self.assertIn("http", str(ctx.exception))
+
     def test_quit_command(self):
         self.assertFalse(self.game.execute("quit"))
 

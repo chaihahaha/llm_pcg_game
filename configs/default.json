@@ -54,6 +54,7 @@
   "game": {
     "db_path": "data/world.db",
     "autosave": true,
+    "allow_mixed_backend": false,
     "player_hp": 30,
     "player_atk": 5,
     "player_def": 2

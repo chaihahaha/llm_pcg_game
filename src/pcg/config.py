@@ -57,6 +57,7 @@ DEFAULTS: Dict[str, Any] = {
     "game": {
         "db_path": "data/world.db",
         "autosave": True,
+        "allow_mixed_backend": False,
         "player_hp": 30,
         "player_atk": 5,
         "player_def": 2,

@@ -32,6 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--script", type=str, default=None, help="按文件中的指令逐行执行（非交互）")
     p.add_argument("--no-story", action="store_true", help="不自动生成任务线")
     p.add_argument("--verbose", "-v", action="store_true", help="打印每次 LLM 调用与耗时")
+    p.add_argument("--allow-mixed", action="store_true",
+                   help="允许用与存档不同来源的后端继续写入（会覆盖已有文本，慎用）")
     return p
 
 
@@ -43,6 +45,8 @@ def main(argv=None) -> int:
         overrides["llm"]["mock"] = True
     if args.db:
         overrides["game"]["db_path"] = args.db
+    if args.allow_mixed:
+        overrides["game"]["allow_mixed_backend"] = True
     cfg = load_config(args.config, overrides)
 
     game = Game(cfg, verbose=args.verbose)
@@ -59,6 +63,7 @@ def main(argv=None) -> int:
                   + ("" if backend == "http" else "（未连接到 127.0.0.1:8080，使用确定性模拟）"))
         else:
             world = game.load_world(args.world_id)
+            game.check_backend_matches()
             print(f"已载入世界：{world['name']}（{world['era']}），第 {game.tick()//24+1} 天")
         script = None
         if args.script:
