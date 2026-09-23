@@ -215,6 +215,37 @@ CREATE TABLE IF NOT EXISTS player (
     updated_tick INTEGER DEFAULT 0
 );
 
+-- Runtime monkey patches: knob overrides, sandboxed hooks and whole code
+-- patches the model invented to change how the game itself behaves.
+CREATE TABLE IF NOT EXISTS patches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    world_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    target TEXT NOT NULL,
+    value_json TEXT DEFAULT '',
+    expr TEXT DEFAULT '',
+    reason TEXT DEFAULT '',
+    source TEXT DEFAULT 'llm',
+    enabled INTEGER DEFAULT 1,
+    created_tick INTEGER DEFAULT 0,
+    UNIQUE(world_id, kind, target)
+);
+CREATE INDEX IF NOT EXISTS idx_patches_world ON patches(world_id, kind, enabled);
+
+-- Actions the model invented for the player, replayable without another call.
+CREATE TABLE IF NOT EXISTS actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    world_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    title TEXT DEFAULT '',
+    description TEXT DEFAULT '',
+    spec_json TEXT DEFAULT '{}',
+    uses INTEGER DEFAULT 0,
+    created_tick INTEGER DEFAULT 0,
+    UNIQUE(world_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_actions_world ON actions(world_id, name);
+
 CREATE TABLE IF NOT EXISTS llm_cache (
     key TEXT PRIMARY KEY,
     task TEXT DEFAULT '',
@@ -963,6 +994,72 @@ class Store:
             return
         vals.append(world_id)
         self.conn.execute(f"UPDATE player SET {', '.join(sets)} WHERE world_id=?", vals)
+
+    # -------------------------------------------------------------- patches
+    def upsert_patch(self, world_id: int, kind: str, target: str, value: Any = None,
+                     expr: str = "", reason: str = "", source: str = "llm",
+                     tick: int = 0) -> None:
+        self.conn.execute(
+            "INSERT INTO patches(world_id,kind,target,value_json,expr,reason,source,enabled,created_tick)"
+            " VALUES(?,?,?,?,?,?,?,1,?)"
+            " ON CONFLICT(world_id,kind,target) DO UPDATE SET value_json=excluded.value_json,"
+            " expr=excluded.expr, reason=excluded.reason, source=excluded.source, enabled=1",
+            (world_id, kind, target, _dumps(value), expr, reason, source, tick),
+        )
+
+    def get_patch(self, world_id: int, kind: str, target: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM patches WHERE world_id=? AND kind=? AND target=?",
+            (world_id, kind, target),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_patches(self, world_id: int, enabled_only: bool = True) -> List[dict]:
+        q = "SELECT * FROM patches WHERE world_id=?"
+        if enabled_only:
+            q += " AND enabled=1"
+        return [dict(r) for r in self.conn.execute(q + " ORDER BY id", (world_id,)).fetchall()]
+
+    def disable_patch(self, patch_id: int) -> None:
+        self.conn.execute("UPDATE patches SET enabled=0 WHERE id=?", (patch_id,))
+
+    def delete_patch(self, patch_id: int) -> None:
+        self.conn.execute("DELETE FROM patches WHERE id=?", (patch_id,))
+
+    def count_patches(self, world_id: int) -> int:
+        return int(self.conn.execute(
+            "SELECT COUNT(*) c FROM patches WHERE world_id=? AND enabled=1",
+            (world_id,)).fetchone()["c"])
+
+    # -------------------------------------------------------------- actions
+    def upsert_action(self, world_id: int, name: str, title: str, description: str,
+                      spec: dict, tick: int = 0) -> None:
+        self.conn.execute(
+            "INSERT INTO actions(world_id,name,title,description,spec_json,uses,created_tick)"
+            " VALUES(?,?,?,?,?,0,?)"
+            " ON CONFLICT(world_id,name) DO UPDATE SET title=excluded.title,"
+            " description=excluded.description, spec_json=excluded.spec_json",
+            (world_id, name[:24], title[:40], description[:200], _dumps(spec), tick),
+        )
+
+    def list_actions(self, world_id: int) -> List[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM actions WHERE world_id=? ORDER BY id", (world_id,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["spec"] = _loads(d.pop("spec_json", "{}"), {})
+            out.append(d)
+        return out
+
+    def get_action(self, world_id: int, name: str) -> Optional[dict]:
+        for a in self.list_actions(world_id):
+            if a["name"] == name or a["title"] == name:
+                return a
+        return None
+
+    def bump_action_use(self, action_id: int) -> None:
+        self.conn.execute("UPDATE actions SET uses=uses+1 WHERE id=?", (action_id,))
 
     # ------------------------------------------------------------- llm cache
     def cache_get(self, key: str) -> Optional[str]:

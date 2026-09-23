@@ -387,6 +387,61 @@ class MockBackend:
             "stakes": "若放任不管，魔力渗漏可能吸引危险生物。",
         }
 
+    def _t_action(self, messages, seed) -> dict:
+        """Mirrors the real contract: interpret free text into an effect program."""
+        text = self._text(messages)
+        intent = ""
+        m = re.search(r"玩家想做：(.*)", text)
+        if m:
+            intent = m.group(1).strip()
+
+        if any(k in intent for k in ("挖", "地底", "洞", "竖井")):
+            return {
+                "feasible": True, "action": "dig_down",
+                "narrative": "你用随身的镐在泥层上开出一口竖井，湿土顺着井壁滑落，冷风从深处涌上来。",
+                "cost_hours": 2,
+                "effects": [
+                    {"op": "set_tile", "dx": 0, "dy": 0, "terrain": "cave",
+                     "name": "竖井口", "desc": "你亲手挖出的竖井，井壁还带着镐痕。"},
+                    {"op": "create_object", "dx": 0, "dy": 0, "kind": "ruin",
+                     "name": "堆起的湿土", "desc": "从井里挖出来的泥土，堆成一圈。"},
+                    {"op": "event", "kind": "discovery", "text": "玩家挖开地表，露出一条通往地底的竖井。"},
+                ],
+                "new_action": {
+                    "name": "dig", "title": "向下挖掘", "description": "在脚下挖一口通往地底的竖井。",
+                    "cost_hours": 2,
+                    "effects": [
+                        {"op": "set_tile", "dx": 0, "dy": 0, "terrain": "cave", "name": "竖井口",
+                         "desc": "你亲手挖出的竖井。"},
+                        {"op": "event", "kind": "discovery", "text": "玩家又向下挖了一段。"},
+                    ],
+                },
+            }
+        if any(k in intent for k in ("砍", "伐", "劈")):
+            ids = re.findall(r"#(\d+)\s*[^；]*?\(tree\)", text)
+            eff = [{"op": "event", "kind": "economy", "text": "玩家砍倒了一棵树。"}]
+            if ids:
+                eff.insert(0, {"op": "destroy_object", "id": int(ids[0]), "desc": "断口新鲜的树桩。"})
+            return {"feasible": True, "action": "chop", "narrative": "你抡起斧子，树身发出一声闷响。",
+                    "cost_hours": 1, "effects": eff}
+        if any(k in intent for k in ("不能说话", "闭嘴", "字符", "字数", "沉默", "禁言",
+                                     "所有人", "NPC", "说长", "短句", "语言")):
+            return {
+                "feasible": True, "action": "silence_curse",
+                "narrative": "你听见空气里响起一阵干涩的低语——某种更古老的东西回应了你，此后人们的话会变短。",
+                "cost_hours": 0, "effects": [
+                    {"op": "event", "kind": "magic", "text": "一道古老的咒语落在所有活物身上。"}],
+                "patch": {"kind": "code",
+                          "source": 'api["set_rule"]("npc_speech_max_chars", 12)',
+                          "reason": "古老的沉默诅咒：所有 NPC 每句话不得超过 12 字。"},
+            }
+        return {
+            "feasible": True, "action": "search", "narrative": "你花了一点时间翻找四周，总算有了收获。",
+            "cost_hours": 1,
+            "effects": [{"op": "grant", "item": "碎石块", "qty": 2},
+                        {"op": "event", "kind": "discovery", "text": "玩家在附近搜寻了一番。"}],
+        }
+
     def _t_flavor(self, messages, seed) -> dict:
         return {"text": pick(["你的攻击擦过它的肩，溅起一线尘土。",
                               "钝响之后，它踉跄半步，獠牙上挂着草屑。",

@@ -199,3 +199,32 @@ chunk 周期是 6 游戏小时，于是每 6 步所有已探索地块一起到�
   只有真的落后多个周期（追赶）才动用 `max_catchup_calls`(8) 的预算。
 * 每次调用前打印 `⟳ 推演地块「…」，补算 N 小时 …`，慢也看得见在做什么。
 * `talk`/`attack` 找不到目标时报出目标坐标与距离，而不是笼统的"附近没有人"。
+
+## 27. 沙箱的坑：eval 的 locals 与 lambda 的 globals 不是一回事
+
+**现象**：`eval("lambda ctx: len(ctx['x'])", {"__builtins__": {}}, SAFE_FUNCS)` 返回的函数
+一调用就 `NameError: name 'len' is not defined`。
+**原因**：`eval(expr, globals, locals)` 里 lambda 的 `__globals__` 是**第二个参数**，
+函数体内的名字只查 globals，不看 locals。
+**修复**：把白名单函数塞进 globals（`env = {"__builtins__": {}}; env.update(SAFE_FUNCS)`）。
+
+## 28. 沙箱的坑：把赋值目标也当成"不允许的名字"
+
+**现象**：`validate_code` 允许 `x = 1` 却拒绝 `result = limit(...)`，
+报"不允许的名字：result"。
+**原因**：`ast.walk` 会遍历所有 `ast.Name`，赋值目标（`ctx=Store`）也被检查了。
+**修复**：只校验 `ctx=Load` 的名字；并先收集补丁自己绑定的名字
+（`def`/赋值目标/函数参数），这些读取一律放行。
+
+## 29. 沙箱的坑：`ast.Module` 不在表达式白名单里
+
+**现象**：`exec_patch` 一片代码都过不了，报"不允许的语法：Module"。
+**原因**：`validate_code` 用"非语句节点必须在表达式白名单里"判断，
+而 `ast.Module` 既不是 `stmt` 也不在表达式白名单。
+**修复**：显式放行 `ast.Module`（以及 `ast.Store`/`ast.Del`）。
+
+## 30. 能力越大越要能回收
+
+模型写坏补丁是常态，因此：补丁存表并带 `enabled`；读档时逐个重新编译，
+失败的**自动停用并报错**；hook 抛异常一律被 `try/except` 兜住返回默认值；
+`rules` 命令直接打印补丁源码，`do` 被拒绝时说明触发了哪条沙箱规则。

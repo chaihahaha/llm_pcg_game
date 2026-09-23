@@ -34,12 +34,13 @@ _MAX_TOKEN_TASKS = 3600
 
 class EvolutionEngine:
     def __init__(self, store: Store, llm: LLMClient, cfg: Dict[str, Any], wm: WorldManager,
-                 logger=None):
+                 logger=None, rules=None):
         self.store = store
         self.llm = llm
         self.cfg = cfg
         self.wm = wm
         self.logger = logger
+        self.rules = rules
         self.world_id = wm.world_id
         self.enabled = bool(cfg_get(cfg, "evolution.enabled", True))
         self.schedule = {
@@ -179,6 +180,13 @@ class EvolutionEngine:
                                    period_hours=self.schedule[lod],
                                    bbox=(node["x"], node["y"], node["w"], node["h"]),
                                    scope_history=str((node.get("data") or {}).get("history", ""))[:400])
+        if self.rules is not None:
+            bias = str(self.rules.get("evolution_bias", "") or "")
+            hooked = self.rules.call("evolve_bias", {"lod": lod, "name": node.get("name", "")},
+                                     default=None)
+            bias += ("；" + hooked) if isinstance(hooked, str) and hooked else ""
+            if bias:
+                text += f"\n【世界法则施加的倾向】{bias[:200]}"
         text = self._fit_budget(text)
         msgs = prompts.build(self.wm.world_bible(), text)
         data = self.llm.json(msgs, task=task, default={})
@@ -485,6 +493,22 @@ class EvolutionEngine:
                                   str(ch.get("text", ""))[:200],
                                   about=str(ch.get("about", ""))[:32])
             self.store.prune_memories(npc["id"], keep=12)
+
+        elif kind == "patch":
+            # a world-level event that rewrites the rules of the game itself
+            target = str(ch.get("patch_kind") or ch.get("target_kind") or "rule")
+            reason = str(ch.get("reason") or ch.get("note") or "")[:200]
+            if self.rules is None:
+                return
+            if target == "rule":
+                self.rules.set_rule(str(ch.get("key", "")), ch.get("value"), reason=reason,
+                                    tick=tick, source="world")
+            elif target == "hook":
+                self.rules.add_hook(str(ch.get("hook", "")), str(ch.get("expr", "")),
+                                    reason=reason, tick=tick, source="world")
+            elif target == "code":
+                self.rules.add_code_patch(str(ch.get("source", "")), reason=reason,
+                                          tick=tick, source_tag="world")
 
         elif kind == "nation" and lod in (LOD_REGION, LOD_WORLD):
             name = str(ch.get("name", "")).strip()

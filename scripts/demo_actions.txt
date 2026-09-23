@@ -1,0 +1,12 @@
+# 自由动作 + 运行时 patch 演示
+look
+inspect
+我要向下挖一口通往地底的竖井
+inspect
+rules
+actions
+dig
+我要让所有 NPC 都不能说长句子
+rules
+talk 你好
+stats

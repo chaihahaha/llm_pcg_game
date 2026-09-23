@@ -12,12 +12,15 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from . import entities, render
+from .actions import ActionResolver
 from .config import cfg_get
 from .db import CacheStore, Store
+from .effects import EffectContext, apply_program
 from .evolution import EvolutionEngine
 from .llm import LLMClient
 from .narrative import Narrator
 from .rng import hash_int
+from .rules import RuntimeRules
 from .world import LOD_CHUNK, WorldManager
 
 _DIRS = ["w", "a", "s", "d", "n", "e", "s", "w"]
@@ -111,9 +114,37 @@ class Game:
 
     def _wire(self) -> None:
         self.world_id = self.wm.world_id
-        self.narrator = Narrator(self.store, self.llm, self.cfg, self.wm, self.logger)
-        self.evolution = EvolutionEngine(self.store, self.llm, self.cfg, self.wm, self.logger)
-        self.player = entities.Player(self.store, self.world_id)
+        self.rules = RuntimeRules(self.store, self.world_id, self.logger)
+        self.narrator = Narrator(self.store, self.llm, self.cfg, self.wm, self.logger,
+                                 rules=self.rules)
+        self.actions = ActionResolver(self.store, self.llm, self.cfg, self.wm, self.rules,
+                                      narrator=self.narrator, logger=self.logger)
+        self.evolution = EvolutionEngine(self.store, self.llm, self.cfg, self.wm, self.logger,
+                                         rules=self.rules)
+        self.player = entities.Player(self.store, self.world_id, rules=self.rules)
+        self._bind_patch_api()
+        self.rules.run_code_patches()
+
+    def _bind_patch_api(self) -> None:
+        """The surface a model-authored patch may monkey-patch."""
+        world = self.store.get_world(self.world_id) or {}
+        player = self.store.get_player(self.world_id) or {}
+        api = {
+            "world": {"name": world.get("name", ""), "era": world.get("era", ""),
+                      "nations": [n["name"] for n in self.store.list_nations(self.world_id)][:8]},
+            "player": {"name": player.get("name", ""), "x": player.get("x", 0),
+                       "y": player.get("y", 0), "hp": player.get("hp", 0),
+                       "level": player.get("level", 1)},
+            "register_action": self._patch_register_action,
+            "log": lambda msg: self.logger.info("[patch] %s", msg),
+        }
+        self.rules.bind_api(api)
+
+    def _patch_register_action(self, spec) -> bool:
+        if not isinstance(spec, dict):
+            return False
+        ok, _ = self.actions.learn(spec, tick=self.tick())
+        return ok
 
     def save(self) -> None:
         self.store.commit()
@@ -236,6 +267,15 @@ class Game:
         if cmd == "stats":
             self._show_stats()
             return True
+        if cmd in ("do", "act", "try"):
+            self._do_freeform(" ".join(rest))
+            return True
+        if cmd in ("actions", "acts"):
+            self._show_actions()
+            return True
+        if cmd in ("rules", "patches", "laws"):
+            self._show_rules()
+            return True
         if cmd == "auto":
             n = 10
             if rest:
@@ -245,8 +285,83 @@ class Game:
                     pass
             self._auto(n)
             return True
-        print(f"未知指令：{cmd}（输入 help 查看指令）")
+        # anything we do not recognise is treated as free-form intent, which is
+        # the point: "挖开这里" should just work
+        self._do_freeform(line)
         return True
+
+    # --------------------------------------------------------- free-form actions
+    def _do_freeform(self, text: str) -> None:
+        assert self.player is not None
+        text = (text or "").strip()
+        if not text:
+            print("用法：do <你想做的事>，例如：do 向下挖一条通往地底的竖井")
+            return
+        program, row = None, None
+        replayed = self.actions.try_learned(text, self.player)
+        if replayed:
+            program, row = replayed
+            self.store.bump_action_use(row["id"])
+            self.store.commit()
+            print(f"（复用已学会的动作「{row['title']}」）")
+        else:
+            print(f"  ⟳ 正在理解「{text}」…", flush=True)
+            program = self.actions.resolve(self.player, text)
+
+        if not program.get("feasible", False):
+            print(program.get("narrative") or "你尝试了一下，但做不到。")
+            return
+        narrative = str(program.get("narrative") or "").strip()
+        if narrative:
+            print(narrative)
+        for line in self.actions.apply(self.player, program):
+            print("  ·", line)
+
+        patch = program.get("patch")
+        if isinstance(patch, dict) and patch:
+            self._apply_patch(patch, reason=f"玩家动作：{text}")
+        new_action = program.get("new_action")
+        if isinstance(new_action, dict) and new_action.get("effects"):
+            ok, name = self.actions.learn(new_action, tick=self.tick())
+            if ok:
+                print(f"※ 学会新动作「{name}」，以后可直接 do {name}")
+
+        hours = self.actions.program_cost(program)
+        if hours > 0:
+            self._report_advance(hours, f"（这个动作花了 {hours} 小时）", mode="local")
+        print(self.draw())
+        if self.player.alive:
+            print(self.look())
+
+    def _apply_patch(self, patch: Dict[str, Any], reason: str, source: str = "player") -> None:
+        kind = str(patch.get("kind") or "").strip()
+        tick = self.tick()
+        if kind == "rule":
+            ok, msg = self.rules.set_rule(str(patch.get("key", "")), patch.get("value"),
+                                          reason=reason, tick=tick, source=source)
+        elif kind == "hook":
+            ok, msg = self.rules.add_hook(str(patch.get("hook", "")), str(patch.get("expr", "")),
+                                          reason=reason, tick=tick, source=source)
+        elif kind == "code":
+            ok, msg = self.rules.add_code_patch(str(patch.get("source", "")), reason=reason,
+                                                tick=tick, source_tag=source)
+        else:
+            return
+        print(f"※ {msg}" if ok else f"（世界法则改写失败：{msg}）")
+
+    def _show_actions(self) -> None:
+        rows = self.store.list_actions(self.world_id)
+        if not rows:
+            print("还没有学会任何新动作。用 `do <描述>` 尝试你想做的事。")
+            return
+        print("已学会的动作：")
+        for a in rows:
+            print(f"  · {a['name']}｜{a['title']}｜{a['description'][:60]}"
+                  f"（用过 {a['uses']} 次）")
+
+    def _show_rules(self) -> None:
+        for line in self.rules.describe():
+            print("  " + line)
 
     # -- individual actions
     def _do_move(self, direction: str) -> None:
@@ -257,9 +372,44 @@ class Game:
             self._resolve_npc_turn()
             return
         self.wm.mark_explored(self.player.x, self.player.y)
-        self._report_advance(1)
+        self._apply_on_enter()
+        self._report_advance(self._move_cost_hours(), mode="local")
         print(self.draw())
         print(self.look())
+
+    def _move_cost_hours(self) -> int:
+        """How long a step takes — a world rule, and a hook may rewrite it."""
+        assert self.player is not None
+        tile = self.store.get_tile(self.world_id, self.player.x, self.player.y) or {}
+        hooked = self.rules.call("move_cost", {"terrain": tile.get("terrain", "grass")},
+                                 default=None)
+        try:
+            if hooked is not None:
+                return max(0, min(48, int(hooked)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            return max(0, min(48, int(self.rules.get("move_cost_hours", 1))))
+        except (TypeError, ValueError):
+            return 1
+
+    def _apply_on_enter(self) -> None:
+        """Let patches and traps react to stepping somewhere."""
+        assert self.player is not None
+        tile = self.store.get_tile(self.world_id, self.player.x, self.player.y) or {}
+        hooked = self.rules.call("on_enter", {"terrain": tile.get("terrain", "grass"),
+                                              "x": self.player.x, "y": self.player.y,
+                                              "name": tile.get("name", "")}, default=None)
+        if not isinstance(hooked, dict):
+            return
+        if hooked.get("narrative"):
+            print(f"  ※ {str(hooked['narrative'])[:200]}")
+        if hooked.get("effects"):
+            ctx = EffectContext(self.store, self.world_id, self.wm, self.rules, self.player,
+                                tick=self.tick(), narrator=self.narrator, actions=self.actions,
+                                logger=self.logger)
+            for line in apply_program(ctx, {"effects": hooked["effects"]}):
+                print("  ·", line)
 
     def _do_goto(self, tx: int, ty: int) -> None:
         assert self.player is not None
@@ -273,7 +423,8 @@ class Game:
             print(reason)
             return
         self.wm.mark_explored(self.player.x, self.player.y)
-        self._report_advance(1)
+        self._apply_on_enter()
+        self._report_advance(self._move_cost_hours(), mode="local")
         print(self.draw())
         print(self.look())
 
@@ -318,7 +469,8 @@ class Game:
         npc = self._npc_target(name, verb="攻击")
         if not npc:
             return
-        result = entities.attack(self.store, self.world_id, self.player, npc, self.tick())
+        result = entities.attack(self.store, self.world_id, self.player, npc, self.tick(),
+                                 rules=self.rules)
         for line in result["log"]:
             print(line)
         if result.get("ok"):

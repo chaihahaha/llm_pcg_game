@@ -123,7 +123,61 @@ events / dialogue / story / player / llm_cache`。
 * **事件时间**：追赶式演化的事件按比例散布在流逝的时间窗内，而不是全挤在同一时刻。
 * **已毁标记**：邻接摘要里已毁物体标 `[已毁]`，模型不会再宣告一次它的毁灭。
 
-## 9. 键名容错
+## 9. 自由动作与运行时 monkey patch
+
+### 9.1 为什么不是裸 `eval`/`exec`
+
+`eval("lambda ctx: ...")` 就是 monkey patch 的标准做法——本项目也确实是这么做的
+（`sandbox.compile_hook`）。但**裸** `eval`/`exec` 会把整台机器的能力交给模型：
+`import os`、`open('data/world.db','w')`、`while True`、`[0]*10**9`，
+而且坏补丁会写进存档，下次读档继续炸。
+
+所以分两层，都经过 AST 校验、都在没有 builtins 的命名空间里执行：
+
+| 层 | 机制 | 能力 |
+| --- | --- | --- |
+| 表达式 | `eval(compile(ast, mode="eval"))` | 一个 `lambda ctx: ...`，装在 hook 点上 |
+| 语句 | `exec(compile(ast, mode="exec"))` | 赋值 / `if` / `for` / `def` / 调用 api |
+
+守卫：无 `import`/`while`/`with`/`class`/`global`/`try`/`raise`；无下划线开头的属性
+（堵住 `__class__`/`__globals__`）；只允许纯函数白名单；整数常量 ≤1e6、禁 `**`
+（防内存炸弹）；语句数与字符数有上限。没有 `while`、`for` 只能遍历我们给的数据，
+所以不存在死循环，不需要超时线程。**这是内容沙箱，不是对抗恶意本地代码的安全边界。**
+
+### 9.2 三个 patch 面
+
+1. **rule**：引擎运行时读取的旋钮（`npc_speech_max_chars`、`move_cost_hours`、
+   `damage_multiplier`、`extra_passable_terrain`、`forbidden_words`、`evolution_bias`…）。
+2. **hook**：装在真实决策点上的 lambda —— `can_enter` / `on_enter` / `damage` /
+   `speech` / `move_cost` / `evolve_bias`。返回 `None` 表示沿用默认。
+3. **code**：语句级补丁，通过注入的 `api`（`set_rule` / `add_hook` /
+   `register_action` / `log`）修改游戏，可定义自己的辅助函数。
+
+补丁存在 `patches` 表，读档时重新编译并**重新执行** code patch，
+因此"诅咒"跨会话生效；编译失败的补丁会被自动停用（`enabled=0`）并报错，绝不带走存档。
+
+### 9.3 自由动作
+
+`do <任意文本>` → 模型输出**动作程序**：
+
+```json
+{"feasible": true, "narrative": "...", "cost_hours": 2,
+ "effects": [{"op":"set_tile","dx":0,"dy":0,"terrain":"cave","name":"竖井口"}],
+ "new_action": {"name":"dig","title":"向下挖掘","effects":[...]},
+ "patch": {"kind":"code","source":"api[\"set_rule\"](\"npc_speech_max_chars\",12)", "reason":"..."}}
+```
+
+`effects` 由 `effects.py` 唯一的解释器落地（坐标必须离玩家 ≤3 格，地形取自固定词表，
+数值夹紧），模型无法直接触碰数据库。可复用的动作写进 `actions` 表，
+下次 `do dig` 直接回放，**不花 LLM 调用**。
+
+### 9.4 人类可读的反馈
+
+- `rules` 打印所有被改过的规则、钩子和 code patch 源码；
+- `actions` 列出学会的动作与使用次数；
+- 补丁被拒绝时明确说明原因（哪条沙箱规则），而不是静默失败。
+
+## 10. 键名容错
 
 本地模型同一提示词会给出 `name` / `world_name` / `region_name` / `area_name`，
 甚至 `"  name"`（键里带前导空格）。处理：

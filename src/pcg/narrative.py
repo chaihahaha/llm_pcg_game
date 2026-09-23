@@ -18,12 +18,13 @@ from .world import WorldManager
 
 class Narrator:
     def __init__(self, store: Store, llm: LLMClient, cfg: Dict[str, Any], wm: WorldManager,
-                 logger=None):
+                 logger=None, rules=None):
         self.store = store
         self.llm = llm
         self.cfg = cfg
         self.wm = wm
         self.logger = logger
+        self.rules = rules
         self.world_id = wm.world_id
         self.max_turns = int(cfg_get(cfg, "context.max_dialogue_turns", 6))
         self.max_event_digest = int(cfg_get(cfg, "context.max_event_digest", 12))
@@ -144,6 +145,13 @@ class Narrator:
         msgs = prompts.build(self.wm.world_bible(), text)
         data = self.llm.json(msgs, task="dialogue", default={})
         reply = str(data.get("reply") or "……").strip()
+        # the world's own laws (and any patch) get the last word on speech
+        if self.rules is not None:
+            hooked = self.rules.call("speech", {"npc": npc["name"], "reply": reply,
+                                                "mood": data.get("mood", "")}, default=None)
+            if isinstance(hooked, str) and hooked:
+                reply = hooked
+            reply = self.rules.sanitize_speech(reply)
         tick = int(self.store.get_meta("tick", 0) or 0)
         self.store.add_dialogue(self.world_id, npc["id"], tick, "player", line)
         self.store.add_dialogue(self.world_id, npc["id"], tick, "npc", reply)

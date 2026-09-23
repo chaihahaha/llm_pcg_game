@@ -197,7 +197,11 @@ def evolve_task(lod_name: str, seed: int, scope_desc: str, local_digest: str,
         '{"type":"tile","x":整数,"y":整数,"terrain":"地形名","desc":"变化描述"},'
         '{"type":"relation","a_kind":"nation|npc","a_name":"名字","b_kind":"nation|npc","b_name":"名字",'
         '"kind":"盟友|敌对|贸易|债主|亲属|师徒|世仇","value":-5到5,"note":"关系变化原因(15-30字)"},'
-        '{"type":"memory","name":"NPC名","kind":"fact|promise|grudge|debt|goal","text":"该NPC此后会记住的事"}]}\n'
+        '{"type":"memory","name":"NPC名","kind":"fact|promise|grudge|debt|goal","text":"该NPC此后会记住的事"},'
+        '{"type":"patch","patch_kind":"rule|hook|code","key":"规则名","value":值,'
+        '"hook":"钩子名","expr":"lambda ctx: ...","source":"python代码","reason":"何种力量改写了世界法则"}]}\n'
+        "type=patch 只用于**改写世界法则**级别的事件（上古诅咒、神谕、魔法灾害等）；"
+        "它会真实改变游戏程序的行为，因此必须罕见（大多数时间步不要产出）且有明确剧情依据。\n"
         f"events 0-3 条，changes 0-4 条（可以只有 events）。{tile_rule}"
         "★ 所有 x/y 一律使用【世界坐标】（与上面给出的范围、以及相邻对象的坐标同一坐标系），"
         "不要使用 0-15 之类的地块内局部坐标；越界的改动会被丢弃。"
@@ -277,6 +281,88 @@ def story_task(seed: int, player_brief: str, world_brief: str, recent: str,
         "如果上一条线索未完成，应当推进它而不是凭空另起炉灶。输出 JSON："
         '{"title":"任务名(4-10字)","summary":"任务背景(40-80字)","objective":"玩家要做什么(20-40字)",'
         '"stakes":"失败后果(15-30字)","hint":"去哪找线索(15-30字)"}'
+    )
+
+
+EFFECT_OPS_DOC = (
+    "可用效果（effects 数组，最多 8 条，坐标为世界坐标，且必须在玩家 3 格内或省略 x/y 表示脚下/相对）：\n"
+    '{"op":"set_tile","x":..,"y":..,"terrain":"地形名","name":"短名","desc":"描述"}  改一格地形\n'
+    '{"op":"create_object","x":..,"y":..,"kind":"rock|ruin|plant|water|building|ore|item|track|altar",'
+    '"name":"名称","desc":"描述","solid":0或1}\n'
+    '{"op":"destroy_object","id":整数,"desc":"如何被毁"}  摧毁附近物体（id 见【附近物体】）\n'
+    '{"op":"create_npc","x":..,"y":..,"name":"人名","race":"民族","role":"身份",'
+    '"personality":"性格","appearance":"外貌"}\n'
+    '{"op":"move_player","dx":..,"dy":..}  或绝对 x/y；必须可通行\n'
+    '{"op":"damage_player","amount":1-50}{"op":"heal_player","amount":1-50}\n'
+    '{"op":"damage_npc","npc":"名字","amount":1-50}{"op":"heal_npc","npc":"名字","amount":1-50}\n'
+    '{"op":"grant","item":"物品名","qty":1-20}  放入玩家背包\n'
+    '{"op":"set_weather","text":"天气"}\n'
+    '{"op":"event","kind":"discovery|conflict|magic|economy|weather","text":"发生了什么"}\n'
+    '{"op":"memory","npc":"名字","kind":"fact|promise|grudge|debt|goal","about":"人或地","text":"记住的事"}\n'
+    '{"op":"relation","a_kind":"npc|nation","a_name":"..","b_kind":"npc|nation","b_name":"..",'
+    '"kind":"盟友|敌对|债主|亲属|师徒","value":-5到5,"note":"原因"}\n'
+    "以下效果会改变**游戏程序本身**（世界级能力，慎用，必须有剧情依据）：\n"
+    '{"op":"rule","key":"规则名","value":值,"reason":"为什么世界规则变了"}\n'
+    '{"op":"hook","hook":"钩子名","expr":"lambda ctx: ...","reason":"..."}\n'
+    '{"op":"code","source":"python 代码","reason":"..."}  用沙箱代码修改游戏行为\n'
+)
+
+RULE_DOC = (
+    "可改规则（rule 的 key）：npc_speech_max_chars(int，NPC 每句话最多多少字，0=不限)；"
+    "move_cost_hours(int 0-48)；damage_multiplier/heal_multiplier(float 0-20)；"
+    "extra_passable_terrain/extra_solid_terrain(list[str] 地形名)；"
+    "forbidden_words(list[str])；evolution_bias(str，世界走向指令)；action_cost_multiplier(float)。"
+)
+
+_SANDBOX_DOC = (
+    "沙箱代码（op=code）允许：赋值、if、for、def、lambda、返回；"
+    "不允许 import、while、with、class、global、try、删文件；"
+    "不许访问任何下划线开头的属性，不许下标以外的 api 属性访问；"
+    "整数常量上限 1e6，禁用 **。\n"
+    "代码里可用的东西：api['set_rule'](key,value)、api['add_hook'](hook, fn)、"
+    "api['register_action'](spec)、api['log'](msg)、api['rules']（规则字典）、"
+    "以及 len/int/str/min/max/sum/sorted 等纯函数。\n"
+    "示例：邪恶魔法师让所有人说话不超过 12 字 ——\n"
+    '  api["set_rule"]("npc_speech_max_chars", 12)\n'
+    "示例：夜间森林可以被穿行 ——\n"
+    '  api["add_hook"]("can_enter", lambda ctx: True if ctx["terrain"] == "forest" else None)\n'
+)
+
+
+def action_task(seed: int, intent: str, player_brief: str, scene: str, inventory: str,
+                world_brief: str, rules_digest: str, hooks_doc: str, ops_doc: str,
+                rule_doc: str, learned: str, max_hours: int) -> str:
+    return (
+        f"[[TASK:action]][[SEED:{seed}]]\n"
+        "你在把玩家的自由文本意图翻译成一个**动作程序**。你既是叙事者也是这个世界的程序员。\n"
+        f"玩家：{player_brief}；背包：{inventory}\n"
+        f"【现场】\n{scene}\n"
+        f"世界背景：{world_brief}\n"
+        f"当前已被改写的世界规则：{rules_digest}\n"
+        f"已存在的钩子：{hooks_doc}\n"
+        f"已学会的动作：{learned or '（无）'}\n"
+        f"玩家想做：{intent}\n"
+        "要求：\n"
+        "1) 先判断可行性。物理上不可能（如凭空飞行、隔空取物、穿越到现实世界）时 feasible=false，"
+        "并在 narrative 里用一两句话说明为什么做不到，effects 留空。\n"
+        "2) 可行时，用 effects 精确表达结果：砍树要 destroy 或改地形，挖地要 set_tile 成 cave 或 "
+        "create_object 竖井，吃饭要 heal_player 等。不要只写不做的空话。\n"
+        "3) cost_hours 给出该动作消耗的游戏小时数（>=0，<=%d）。\n"
+        "4) 若这个动作之后还会反复用到，或玩家表达的是一个**改变世界规则的意愿**"
+        "（例如\"我要让所有人都不能说出真话\"），请同时给出 patch 字段：" % max_hours
+        + "\n" + _SANDBOX_DOC
+        + "\n5) 若这是一个值得记住的通用动作，给出 new_action："
+        '{"name":"英文或拼音短名","title":"中文名","description":"说明","cost_hours":整数,'
+        '"effects":[...]}（坐标请用 dx/dy 相对玩家）。\n'
+        + ops_doc + rule_doc +
+        "\n输出 JSON："
+        '{"feasible":true|false,"action":"短名","narrative":"发生什么(40-100字，第二人称)",'
+        '"cost_hours":整数,"effects":[...],'
+        '"new_action":{"name":"..","title":"..","description":"..","cost_hours":整数,"effects":[...]},'
+        '"patch":{"kind":"code|rule|hook","source":"python代码","key":"规则名","value":值,'
+        '"hook":"钩子名","expr":"lambda ctx: ...","reason":"为什么世界规则被改写"},'
+        '"action_result":"一句话结果摘要"}'
+        "new_action 与 patch 都可省略。patch 只在与剧情相符时给出。"
     )
 
 

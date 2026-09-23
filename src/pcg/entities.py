@@ -21,9 +21,10 @@ _DIRS = {
 
 
 class Player:
-    def __init__(self, store: Store, world_id: int):
+    def __init__(self, store: Store, world_id: int, rules=None):
         self.store = store
         self.world_id = world_id
+        self.rules = rules
         row = store.get_player(world_id)
         if row is None:
             raise RuntimeError("player row missing")
@@ -57,7 +58,7 @@ class Player:
     def move_to(self, x: int, y: int) -> Tuple[bool, str]:
         if not self.alive:
             return False, "你已经倒下了。"
-        ok, reason = can_enter(self.store, self.world_id, x, y)
+        ok, reason = can_enter(self.store, self.world_id, x, y, self.rules)
         if not ok:
             return False, reason
         self._write(x=x, y=y)
@@ -74,6 +75,10 @@ class Player:
 
     def heal(self, amount: int) -> None:
         self._write(hp=min(int(self.data["hp_max"]), self.hp + max(0, int(amount))))
+
+    @property
+    def inventory(self) -> Dict[str, int]:
+        return dict((self.data.get("state") or {}).get("inventory") or {})
 
     def gain_xp(self, amount: int) -> List[str]:
         msgs: List[str] = []
@@ -94,15 +99,40 @@ class Player:
 
 # --------------------------------------------------------------------- queries
 
-def can_enter(store: Store, world_id: int, x: int, y: int) -> Tuple[bool, str]:
+def can_enter(store: Store, world_id: int, x: int, y: int, rules=None) -> Tuple[bool, str]:
+    """May the player step onto (x, y)?
+
+    ``rules`` (a :class:`pcg.rules.RuntimeRules`) lets the world's own laws —
+    and any patch the model installed — rewrite the answer.
+    """
     tile = store.get_tile(world_id, x, y)
-    if tile is None:
-        return True, ""
-    if is_solid(tile["terrain"]):
-        return False, f"{tile.get('name') or tile['terrain']} 挡住了去路。"
-    for obj in store.objects_at(world_id, x, y):
-        if obj.get("solid"):
-            return False, f"{obj['name']} 挡住了去路。"
+    objs = store.objects_at(world_id, x, y) if tile is not None else []
+
+    if tile is not None:
+        blocked_reason = None
+        if is_solid(tile["terrain"]):
+            blocked_reason = f"{tile.get('name') or tile['terrain']} 挡住了去路。"
+        if blocked_reason is None:
+            for obj in objs:
+                if obj.get("solid"):
+                    blocked_reason = f"{obj['name']} 挡住了去路。"
+                    break
+        if rules is not None:
+            passable = rules.is_terrain_passable(tile["terrain"], not is_solid(tile["terrain"]))
+            hook = rules.call("can_enter", {
+                "terrain": tile["terrain"], "x": x, "y": y, "base_blocked": blocked_reason is not None,
+                "has_object": bool(objs), "name": tile.get("name") or "",
+            }, default=None)
+            if hook is True:
+                blocked_reason = None          # the world's laws now allow it
+            elif hook is False:
+                return False, f"某种力量阻止你进入{tile['terrain']}。"
+            elif hook is None and passable and blocked_reason and blocked_reason.startswith(
+                    tile.get("name") or tile["terrain"]):
+                blocked_reason = None          # terrain was made passable by a rule
+        if blocked_reason:
+            return False, blocked_reason
+
     npcs = store.npcs_at(world_id, x, y)
     if npcs:
         names = "、".join(n["name"] for n in npcs[:2])
@@ -130,7 +160,8 @@ def _roll(seed_key, lo: int, hi: int) -> int:
     return lo + hash_int(*seed_key, mod=(hi - lo + 1))
 
 
-def attack(store: Store, world_id: int, player: Player, npc: dict, tick: int) -> Dict[str, Any]:
+def attack(store: Store, world_id: int, player: Player, npc: dict, tick: int,
+           rules=None) -> Dict[str, Any]:
     """One player attack + one retaliation.  Pure Python, deterministic."""
     if not npc or not npc.get("alive", 1):
         return {"ok": False, "log": ["目标已经倒下。"]}
@@ -138,6 +169,16 @@ def attack(store: Store, world_id: int, player: Player, npc: dict, tick: int) ->
     seed_key = ("atk", world_id, npc["id"], tick, player.hp)
     log: List[str] = []
     dmg = max(1, int(player.data["atk"]) + _roll(seed_key + ("p",), 0, 3) - int(npc["def"]))
+    if rules is not None:
+        base = max(1, int(round(dmg * float(rules.get("damage_multiplier", 1.0)))))
+        hooked = rules.call("damage", {
+            "attacker": player.data.get("name", "你"), "defender": npc["name"],
+            "base": base, "npc_role": npc.get("role", ""), "npc_race": npc.get("race", ""),
+        }, default=None)
+        try:
+            dmg = max(1, int(hooked)) if hooked is not None else base
+        except (TypeError, ValueError):
+            dmg = base
     npc_hp = int(npc["hp"]) - dmg
     log.append(f"你击中 {npc['name']}，造成 {dmg} 点伤害。")
     killed = npc_hp <= 0
