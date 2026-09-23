@@ -49,6 +49,7 @@ DEFAULTS: Dict[str, Any] = {
         "max_prompt_tokens": 24000,
         "max_dialogue_turns": 6,
         "max_event_digest": 12,
+        "npc_memory_keep": 24,
     },
     "game": {
         "db_path": "data/world.db",

@@ -8,7 +8,7 @@ Rule 3: prompts never contain raw world state, only bounded digests.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 from .terrain import legend_text
 
@@ -66,8 +66,11 @@ def world_task(seed: int, hint: str = "") -> str:
         '"magic_system":"魔法体系与代价(40-80字)","tech_baseline":"主流科技水平(20-40字)",'
         '"summary":"世界现状(60-120字)","nations":[{"name":"国名","race":"主体民族",'
         '"gov":"政体","tech":"科技标签(2-4字)","magic":"魔法亲和(2-6字)",'
-        '"resources":["矿产或农产品"],"summary":"国家概要(20-40字)","capital_x":整数,"capital_y":整数}]}\n'
+        '"resources":["矿产或农产品"],"summary":"国家概要(20-40字)","capital_x":整数,"capital_y":整数}],'
+        '"relations":[{"a":"国名A","b":"国名B","kind":"敌对|盟友|贸易|冷战|朝贡|世仇",'
+        '"value":-5到5的整数,"note":"关系由来(15-30字)"}]}\n'
         "nations 数量 3-5 个，capital 坐标范围 0-600。"
+        "relations 给出 3-6 条国家之间的关系边，a/b 必须是上面 nations 里的国名。"
     )
 
 
@@ -115,12 +118,15 @@ def chunk_task(seed: int, zone: Dict[str, Any], cx: int, cy: int, size: int) -> 
         '"patches":[{"terrain":"地形名","x":0,"y":0,"w":8,"h":16},'
         '{"terrain":"地形名","x":8,"y":0,"w":8,"h":9}],'
         '"features":[{"x":0,"y":0,"kind":"rock|ruin|plant|arcane|water|building","name":"名称","desc":"描述(15-35字)"}],'
-        '"npcs":[{"x":0,"y":0,"name":"人名","race":"民族","role":"身份","personality":"性格"}]}\n'
+        '"npcs":[{"x":0,"y":0,"name":"人名","race":"民族","role":"身份","personality":"性格"}],'
+        '"relations":[{"a":"人名","b":"另一个人名或国名","kind":"盟友|敌对|亲属|债主|师徒|雇主|同乡",'
+        '"value":-5到5,"note":"关系由来(10-25字)"}]}\n'
         f"patches 为 3-6 个矩形地块，x/y 是左上角坐标(0-{maxc})，w/h 至少 2，"
         "矩形可重叠（后面的覆盖前面的），未覆盖处会按主导地形自动填充。"
         f"地形名只能取：{legend_text()}\n"
         "地形要与父区域一致（以主导地形为主，水/林/丘陵点缀），避免全图单一地形。"
         f"features 2-4 个，npcs 0-2 个，坐标必须是 0-{maxc} 的整数。"
+        "relations 可为空数组；若有 npcs 且彼此相识（同乡、雇主、仇家等），给 1-3 条。"
     )
 
 
@@ -140,14 +146,32 @@ def tile_task(seed: int, tile: Dict[str, Any], zone_name: str, chunk_summary: st
 
 def evolve_task(lod_name: str, seed: int, scope_desc: str, local_digest: str,
                 higher_digest: str, neighbor_digest: str, hour: int, day: int,
-                allow_tiles: bool) -> str:
+                allow_tiles: bool, elapsed_hours: int = 0, period_hours: int = 0,
+                bbox: Tuple[int, int, int, int] | None = None) -> str:
     tile_rule = (
         "允许 type=tile 修改单格地形（谨慎使用，最多 1 处）。"
         if allow_tiles else "不要修改单格地形。"
     )
+    leap = ""
+    if period_hours and elapsed_hours > period_hours * 3 // 2:
+        skipped = max(1, elapsed_hours // max(1, period_hours))
+        leap = (
+            f"⚠ 本层上一次演化到现在已经过去 {elapsed_hours} 小时（约 {skipped} 个周期），"
+            "玩家不在场。请一次性推演这段时间的**累积**变化：可以有多次兴衰、"
+            "渐进式的恶化或恢复、人口的迁移、关系的变化；不要只描写一瞬间的小事。"
+            "summary 要概括这段时期的整体走向。\n"
+        )
+    scope_line = ""
+    if bbox:
+        sx, sy, sw, sh = bbox
+        scope_line = (f"[[SCOPE:{sx},{sy},{sw},{sh}]]\n"
+                      f"本层在世界坐标中的范围：x ∈ [{sx}, {sx + sw - 1}]，"
+                      f"y ∈ [{sy}, {sy + sh - 1}]。\n")
     return (
         f"[[TASK:evolve_{lod_name}]][[SEED:{seed}]]\n"
+        f"{scope_line}"
         f"当前时间：第 {day} 天 第 {hour} 时。\n"
+        f"{leap}"
         f"【本层对象】{scope_desc}\n"
         f"【本层近期历史】{local_digest or '无'}\n"
         f"【更高层级(LOD 更高)的演化结果】{higher_digest or '无'}\n"
@@ -160,37 +184,65 @@ def evolve_task(lod_name: str, seed: int, scope_desc: str, local_digest: str,
         '{"type":"new_npc","x":整数,"y":整数,"name":"人名","race":"民族","role":"身份","personality":"性格"},'
         '{"type":"npc","name":"已有NPC名","hp_delta":整数,"move":[dx,dy],"mood":"情绪","note":"发生了什么"},'
         '{"type":"object","id":整数,"destroyed":true},'
-        '{"type":"tile","x":整数,"y":整数,"terrain":"地形名","desc":"变化描述"}]}\n'
+        '{"type":"tile","x":整数,"y":整数,"terrain":"地形名","desc":"变化描述"},'
+        '{"type":"relation","a_kind":"nation|npc","a_name":"名字","b_kind":"nation|npc","b_name":"名字",'
+        '"kind":"盟友|敌对|贸易|债主|亲属|师徒|世仇","value":-5到5,"note":"关系变化原因(15-30字)"},'
+        '{"type":"memory","name":"NPC名","kind":"fact|promise|grudge|debt|goal","text":"该NPC此后会记住的事"}]}\n'
         f"events 0-3 条，changes 0-4 条（可以只有 events）。{tile_rule}"
-        "新增物体的坐标必须落在本层的坐标范围内。"
+        "★ 所有 x/y 一律使用【世界坐标】（与上面给出的范围、以及相邻对象的坐标同一坐标系），"
+        "不要使用 0-15 之类的地块内局部坐标；越界的改动会被丢弃。"
+        "relation / memory 里出现的名字必须是【本层对象】或【相邻对象现状】里已有的名字，不要发明新名字。"
+        "关系变化要克制：没有明确事件支撑就不要改动关系。"
     )
 
 
 def dialogue_task(seed: int, npc: Dict[str, Any], world_brief: str, place: str,
-                  local_events: str, history: str, player_line: str, quest: str) -> str:
+                  local_events: str, history: str, player_line: str, quest: str,
+                  memories: str = "", relations: str = "") -> str:
     return (
         f"[[TASK:dialogue]][[NPC:{npc.get('name','')}]][[SEED:{seed}]]\n"
         f"你扮演 NPC「{npc.get('name','')}」，{npc.get('race','')}，{npc.get('role','')}，"
         f"性格：{npc.get('personality','')}，当前情绪：{npc.get('mood','平静')}。\n"
         f"所处位置：{place}。世界背景：{world_brief}\n"
         f"当地近期传闻：{local_events or '无'}\n"
+        f"你记得的事（这是你的长期记忆，必须与之一致，不得遗忘或否认）：{memories or '（暂无）'}\n"
+        f"你的人际关系（必须保持一致，可流露态度）：{relations or '（暂无）'}\n"
         f"你们之前的对话：\n{history or '（初次见面）'}\n"
         f"玩家说：{player_line}\n"
         f"玩家当前任务：{quest or '暂无'}\n"
-        "用 NPC 的口吻回答（1-3 句，符合身份、性格与当地见闻，可以夹带线索或提出请求）。输出 JSON："
+        "用 NPC 的口吻回答（1-3 句，符合身份、性格与当地见闻，可以夹带线索或提出请求）。"
+        "绝不能与上述记忆或先前对话矛盾；若玩家问到你不知道的事，就承认不知道。输出 JSON："
         '{"reply":"NPC说的话","mood":"回答后NPC的情绪","action":"none|quest|trade|attack|info",'
-        '"action_data":{"quest_title":"当 action=quest 时给出","quest_summary":"任务概要"}}'
+        '"action_data":{"quest_title":"当 action=quest 时给出","quest_summary":"任务概要"},'
+        '"memories":[{"kind":"fact|promise|grudge|debt|goal","about":"涉及的人或地","text":"本次对话后你会记住的新事"}],'
+        '"relation_changes":[{"kind":"盟友|敌对|债主|亲属|师徒","value":-5到5,"note":"为什么"}]}'
+        "memories 只在本次对话真的产生了新信息时才给（0-2 条）。"
+    )
+
+
+def memory_consolidate_task(seed: int, npc: Dict[str, Any], memories: str) -> str:
+    return (
+        f"[[TASK:memory]][[NPC:{npc.get('name','')}]][[SEED:{seed}]]\n"
+        f"NPC「{npc.get('name','')}」（{npc.get('race','')}，{npc.get('role','')}）"
+        f"积累了很多记忆，需要压缩成更少的条目以免遗忘。\n"
+        f"现有记忆：\n{memories}\n"
+        "把这些记忆合并、去重、抽象成 5-8 条长期记忆：保留对身份、立场、恩怨、承诺、"
+        "重大见闻至关重要的内容，丢弃无关细节，但**不得丢掉任何冲突、承诺、债务或人名**。输出 JSON："
+        '{"memories":[{"kind":"fact|promise|grudge|debt|goal|history","about":"涉及的人或地","text":"记忆"}]}'
     )
 
 
 def story_task(seed: int, player_brief: str, world_brief: str, recent: str,
-               current: str) -> str:
+               current: str, saga: str = "", world_events: str = "") -> str:
     return (
         f"[[TASK:story]][[SEED:{seed}]]\n"
         f"{player_brief}\n世界背景：{world_brief}\n"
         f"最近发生的事：{recent or '无'}\n"
+        f"世界/区域层面的动向：{world_events or '无'}\n"
+        f"玩家已经经历过的事件线（必须与之一致，可以承接或收束，不得当作没发生过）：\n{saga or '（还没有）'}\n"
         f"上一个任务：{current or '无'}\n"
-        "请设计接下来推动故事的一条任务线。要与世界大势或当地传闻挂钩，规模可完成（数分钟到十几分钟）。输出 JSON："
+        "请设计接下来推动故事的一条任务线。要与世界大势或当地传闻挂钩，规模可完成（数分钟到十几分钟）。"
+        "如果上一条线索未完成，应当推进它而不是凭空另起炉灶。输出 JSON："
         '{"title":"任务名(4-10字)","summary":"任务背景(40-80字)","objective":"玩家要做什么(20-40字)",'
         '"stakes":"失败后果(15-30字)","hint":"去哪找线索(15-30字)"}'
     )

@@ -111,9 +111,11 @@ class WorldManager:
         self.store.upsert_node(self.world_id, LOD_WORLD, 0, 0, world_node_size, world_node_size,
                                "world", name, summary, world_data, None, tick=0)
 
+        nation_names = set()
         for nation in (_field(data, "nations", "countries", "kingdoms", default=[]) or [])[: self.max_nations]:
             if not isinstance(nation, dict) or not nation.get("name"):
                 continue
+            nation_names.add(str(nation["name"])[:24])
             self.store.upsert_nation(
                 self.world_id, str(nation["name"]),
                 race=str(nation.get("race", ""))[:24],
@@ -124,6 +126,20 @@ class WorldManager:
                 capital_y=int(nation.get("capital_y", 0) or 0),
                 resources=[str(r)[:16] for r in (nation.get("resources") or [])][:6],
                 summary=str(nation.get("summary", ""))[:200],
+            )
+        # seed the diplomacy graph; only edges between nations we actually created
+        for rel in (_field(data, "relations", "diplomacy", "nation_relations", default=[]) or [])[:12]:
+            if not isinstance(rel, dict):
+                continue
+            a = str(_field(rel, "a", "from", "source", default=""))[:24]
+            b = str(_field(rel, "b", "to", "target", default=""))[:24]
+            if a not in nation_names or b not in nation_names or a == b:
+                continue
+            self.store.upsert_relation(
+                self.world_id, "nation", a, "nation", b,
+                kind=str(_field(rel, "kind", "type", "relation", default="中立"))[:16],
+                value=int(_field(rel, "value", "score", default=0) or 0),
+                note=str(_field(rel, "note", "reason", "desc", default=""))[:160], tick=0,
             )
         self.store.add_event(self.world_id, 0, LOD_WORLD, None, 0, 0, "genesis",
                              f"世界「{name}」于{era}成形：" + summary[:80])
@@ -300,12 +316,34 @@ class WorldManager:
                                   str(feat.get("desc", ""))[:200],
                                   solid=_OBJ_SOLID.get(kind, 0), tick=tick)
 
+        name_map = {}
         for n in data.get("npcs", []):
-            name = self._unique_npc_name(str(n.get("name", "无名者")))
+            original = str(n.get("name", "无名者"))
+            name = self._unique_npc_name(original)
+            name_map[original.strip()] = name
             self.store.add_npc(
                 self.world_id, ox + int(n["x"]), oy + int(n["y"]),
                 name, race=str(n.get("race", "")), role=str(n.get("role", "")),
                 personality=str(n.get("personality", "")), tick=tick,
+            )
+
+        # relationships declared with this chunk
+        for rel in (data.get("relations") or [])[:6]:
+            if not isinstance(rel, dict):
+                continue
+            a = name_map.get(str(rel.get("a", "")).strip(), "")
+            b_raw = str(rel.get("b", "")).strip()
+            b = name_map.get(b_raw, b_raw)
+            b_kind = "npc" if b_raw in name_map else "nation"
+            if not a or not b:
+                continue
+            if b_kind == "nation" and self.store.get_nation(self.world_id, b) is None:
+                continue
+            self.store.upsert_relation(
+                self.world_id, "npc", a, b_kind, b,
+                kind=str(rel.get("kind", "中立"))[:16],
+                value=int(rel.get("value", 0) or 0),
+                note=str(rel.get("note", ""))[:160], tick=tick,
             )
 
     def _unique_npc_name(self, name: str) -> str:

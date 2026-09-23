@@ -54,13 +54,22 @@ class EvolutionEngine:
         self.max_local_events = int(cfg_get(cfg, "evolution.max_local_events", 8))
         self.max_higher_events = int(cfg_get(cfg, "evolution.max_higher_events", 6))
         self.max_prompt_tokens = int(cfg_get(cfg, "context.max_prompt_tokens", 24000))
+        self.catchup_steps = int(cfg_get(cfg, "evolution.catchup_steps", 3))
+        self.max_catchup_calls = int(cfg_get(cfg, "evolution.max_catchup_calls", 8))
 
     # ------------------------------------------------------------------ tick
     def tick(self) -> int:
         return int(self.store.get_meta("tick", 0) or 0)
 
     def advance(self, hours: int, px: int, py: int) -> List[dict]:
-        """Advance world time and run every due LOD.  Returns new events."""
+        """Advance world time and evolve every due scope, anywhere in the world.
+
+        Scopes are *not* limited to the player's vicinity: an area the player
+        left behind must keep living, otherwise returning to it reveals a
+        frozen museum.  When a scope is overdue by several periods the elapsed
+        time is summarised in a single "catch-up" call rather than replayed
+        step by step.
+        """
         if hours <= 0:
             return []
         start = self.tick()
@@ -68,15 +77,15 @@ class EvolutionEngine:
         self.store.set_meta("tick", new_tick)
         if not self.enabled:
             return []
+        plan = self._plan(new_tick, px, py)
+        budget = self.max_calls
+        if any(steps >= self.catchup_steps for _, _, steps, _ in plan):
+            budget = max(budget, self.max_catchup_calls)
         produced: List[dict] = []
-        calls = 0
-        for lod, scope in self._due_scopes(new_tick, px, py):
-            if calls >= self.max_calls:
-                break
+        for lod, scope, steps, elapsed in plan[:budget]:
             try:
-                events = self.evolve_scope(lod, scope, new_tick, px, py)
-                produced.extend(events)
-                calls += 1
+                produced.extend(self.evolve_scope(lod, scope, new_tick, px, py,
+                                                  elapsed_hours=elapsed))
             except Exception as exc:  # noqa: BLE001 - never let one scope kill the tick
                 if self.logger:
                     self.logger.warning("evolution failed at lod %s node %s: %s",
@@ -86,50 +95,43 @@ class EvolutionEngine:
         self.store.commit()
         return produced
 
-    def _due_scopes(self, tick: int, px: int, py: int) -> List[Tuple[int, dict]]:
-        """Scopes to evolve this advance, coarsest LOD first.
+    def _plan(self, tick: int, px: int, py: int) -> List[Tuple[int, dict, int, int]]:
+        """(lod, node, overdue_steps, elapsed_hours) for every due scope.
 
-        Ordering matters: the world/region/zone steps of *this* advance must be
-        applied before the local chunk step, because the chunk prompt consumes
-        the higher-LOD events as its "higher digest".  A reserved local budget
-        guarantees the coarse levels can never starve tile-level detail.
+        Coarsest LOD first so this advance's macro events are available to the
+        finer prompts that follow.  Nearest chunks come next, so a player who
+        just walked somewhere always gets that place resolved first.
         """
-        chunks: List[dict] = []
-        cs = self.wm.chunk_size
-        r = int(cfg_get(self.cfg, "evolution.neighbor_radius", 6))
-        candidates = self.store.nodes_in_rect(self.world_id, LOD_CHUNK,
-                                              px - cs * (r + 1), py - cs * (r + 1),
-                                              px + cs * (r + 1), py + cs * (r + 1))
-        candidates.sort(key=lambda n: (abs(n["x"] - px) + abs(n["y"] - py)))
-        for node in candidates:
-            if tick - int(node.get("updated_tick") or 0) >= self.schedule[LOD_CHUNK]:
-                chunks.append(node)
-
-        higher: List[Tuple[int, dict]] = []
+        dist = lambda n: abs(n["x"] - px) + abs(n["y"] - py)  # noqa: E731
+        higher: List[Tuple[int, dict, int, int]] = []
         for lod in (LOD_WORLD, LOD_REGION, LOD_ZONE):
-            node = self.wm.ensure_node(lod, px, py)
-            if tick - int(node.get("updated_tick") or 0) >= self.schedule[lod]:
-                higher.append((lod, node))
+            if lod != LOD_WORLD:
+                # only scopes that have actually been generated
+                nodes = sorted(self.store.nodes_of_lod(self.world_id, lod), key=dist)
+            else:
+                nodes = self.store.nodes_of_lod(self.world_id, LOD_WORLD)
+            for node in nodes:
+                elapsed = tick - int(node.get("updated_tick") or 0)
+                steps = elapsed // max(1, self.schedule[lod])
+                if steps >= 1:
+                    higher.append((lod, node, steps, elapsed))
+        higher.sort(key=lambda t: (t[0], dist(t[1])))
+
+        chunks: List[Tuple[int, dict, int, int]] = []
+        for node in sorted(self.store.nodes_of_lod(self.world_id, LOD_CHUNK), key=dist):
+            elapsed = tick - int(node.get("updated_tick") or 0)
+            steps = elapsed // max(1, self.schedule[LOD_CHUNK])
+            if steps >= 1:
+                chunks.append((LOD_CHUNK, node, steps, elapsed))
 
         local_budget = int(cfg_get(self.cfg, "evolution.max_chunk_scopes_per_advance", 2))
-        chosen: List[Tuple[int, dict]] = [(LOD_CHUNK, c) for c in chunks[:local_budget]]
-        remaining = max(0, self.max_calls - len(chosen))
-        for lod, node in higher:
-            if remaining <= 0:
-                break
-            chosen.append((lod, node))
-            remaining -= 1
-        for node in chunks[local_budget:]:
-            if remaining <= 0:
-                break
-            chosen.append((LOD_CHUNK, node))
-            remaining -= 1
-
-        chosen.sort(key=lambda t: t[0])  # world -> region -> zone -> chunk
-        return chosen
+        plan = higher + chunks[:local_budget]
+        plan += chunks[local_budget:]
+        return plan
 
     # ---------------------------------------------------------------- scoping
-    def evolve_scope(self, lod: int, node: dict, tick: int, px: int, py: int) -> List[dict]:
+    def evolve_scope(self, lod: int, node: dict, tick: int, px: int, py: int,
+                     elapsed_hours: int = 0) -> List[dict]:
         day, hour = tick // 24 + 1, tick % 24
         scope_desc = self._scope_desc(lod, node)
         local_digest = prompts.digest_events(
@@ -142,7 +144,10 @@ class EvolutionEngine:
         task = f"evolve_{LOD_NAMES[lod]}"
         seed = hash_int("evolve", self.world_id, node["id"], tick, mod=2 ** 31)
         text = prompts.evolve_task(LOD_NAMES[lod], seed, scope_desc, local_digest,
-                                   higher_digest, neighbor_digest, hour, day, allow_tiles)
+                                   higher_digest, neighbor_digest, hour, day, allow_tiles,
+                                   elapsed_hours=elapsed_hours,
+                                   period_hours=self.schedule[lod],
+                                   bbox=(node["x"], node["y"], node["w"], node["h"]))
         text = self._fit_budget(text)
         msgs = prompts.build(self.wm.world_bible(), text)
         data = self.llm.json(msgs, task=task, default={})
@@ -164,6 +169,19 @@ class EvolutionEngine:
         else:
             bits.append(f"天气：{data.get('weather','')}")
             bits.append("地物：" + "、".join(f.get("name", "") for f in data.get("features", [])[:3]))
+        if lod in (LOD_WORLD, LOD_REGION):
+            rels = self.store.list_relations(self.world_id, kind="nation", limit=8)
+            if rels:
+                bits.append("国家关系：" + "；".join(
+                    f"{r['a_name']}--{r['kind']}({r['value']})-->{r['b_name']}" for r in rels[:6]))
+        if lod == LOD_CHUNK:
+            npcs = self.store.npcs_near(self.world_id, node["x"] + 8, node["y"] + 8, 12, limit=8)
+            rel_lines = []
+            for n in npcs:
+                for r in self.store.relations_for(self.world_id, "npc", n["name"], limit=3):
+                    rel_lines.append(f"{n['name']}--{r['kind']}({r['value']})-->{r['other_name']}")
+            if rel_lines:
+                bits.append("人物关系：" + "；".join(rel_lines[:6]))
         stats = self.store.stats(self.world_id)
         bits.append(f"世界规模：地块{stats['tiles']}/物体{stats['objects']}/NPC{stats['npcs']}")
         return "｜".join(bits)
@@ -207,7 +225,10 @@ class EvolutionEngine:
                     f"#{o['id']}[{o['x']},{o['y']}]{o['name']}({o['kind']})" for o in picks))
             if npcs:
                 parts.append("NPC：" + "；".join(
-                    f"[{n['name']}@{n['x']},{n['y']},{n['role']},HP{n['hp']},{n['mood']}]" for n in npcs))
+                    f"[{n['name']}@{n['x']},{n['y']},{n['role']},HP{n['hp']},{n['mood']}]"
+                    + (f"记得：{m['text'][:30]}" if (m := (self.store.npc_memories(n["id"], 1) or [None])[0])
+                       else "")
+                    for n in npcs))
             return "\n".join(parts)
         if lod == LOD_ZONE:
             subs = self.store.nodes_in_rect(self.world_id, LOD_CHUNK, node["x"], node["y"],
@@ -295,9 +316,11 @@ class EvolutionEngine:
             npc = self.store.find_npc_by_name(self.world_id, name) if name else None
             if not npc:
                 return
+            if not npc.get("alive", 1):
+                return  # the dead do not evolve
             patch: Dict[str, Any] = {}
             if ch.get("hp_delta") is not None:
-                hp = max(0, int(npc["hp"]) + int(ch["hp_delta"]))
+                hp = max(0, min(int(npc["hp_max"]), int(npc["hp"]) + int(ch["hp_delta"])))
                 patch["hp"] = hp
                 if hp == 0:
                     patch["alive"] = 0
@@ -322,14 +345,26 @@ class EvolutionEngine:
             oid = ch.get("id")
             if oid is None:
                 return
+            obj = self.store.get_object(int(oid))
+            if obj is None:
+                return
             if ch.get("destroyed"):
-                self.store.delete_object(int(oid))
+                if obj.get("alive", 1):
+                    self.store.destroy_object(int(oid), tick=tick,
+                                              desc=str(ch.get("desc", "") or "")[:200])
+                    self.store.add_event(self.world_id, tick, lod, node["id"],
+                                         obj["x"], obj["y"], "destruction",
+                                         f"{obj['name']}被毁")
             else:
-                patch = {}
+                patch: Dict[str, Any] = {}
                 if ch.get("desc"):
-                    patch["desc"] = str(ch["desc"])[:200]
+                    # keep history: a new description is appended, never a rewrite
+                    prev = (obj.get("state") or {}).get("last_desc") or obj.get("desc") or ""
+                    patch["desc"] = (str(ch["desc"])[:200] if not prev
+                                     else f"{str(ch['desc'])[:120]}（原为：{prev[:60]}）")
                 if ch.get("hp") is not None:
-                    patch["hp"] = int(ch["hp"])
+                    patch["hp"] = max(0, min(int(obj.get("hp_max") or 0) or 10 ** 6,
+                                             int(ch["hp"])))
                 patch["updated_tick"] = tick
                 self.store.update_object(int(oid), **patch)
 
@@ -343,6 +378,33 @@ class EvolutionEngine:
                                           desc=str(ch.get("desc", ""))[:200] or None,
                                           updated_tick=tick)
 
+        elif kind == "relation":
+            a_kind = str(ch.get("a_kind", "")).strip().lower()
+            b_kind = str(ch.get("b_kind", "")).strip().lower()
+            a_name = str(ch.get("a_name", "")).strip()[:32]
+            b_name = str(ch.get("b_name", "")).strip()[:32]
+            if a_kind not in ("nation", "npc") or b_kind not in ("nation", "npc"):
+                return
+            if not self._entity_exists(a_kind, a_name) or not self._entity_exists(b_kind, b_name):
+                return
+            self.store.upsert_relation(
+                self.world_id, a_kind, a_name, b_kind, b_name,
+                kind=str(ch.get("kind", "中立"))[:16],
+                value=int(ch.get("value", 0) or 0),
+                note=str(ch.get("note", ""))[:160], tick=tick,
+            )
+
+        elif kind == "memory":
+            name = str(ch.get("name", "")).strip()
+            npc = self.store.find_npc_by_name(self.world_id, name) if name else None
+            if not npc:
+                return
+            self.store.add_memory(self.world_id, npc["id"], tick,
+                                  str(ch.get("kind", "fact"))[:16],
+                                  str(ch.get("text", ""))[:200],
+                                  about=str(ch.get("about", ""))[:32])
+            self.store.prune_memories(npc["id"], keep=12)
+
         elif kind == "nation" and lod in (LOD_REGION, LOD_WORLD):
             name = str(ch.get("name", "")).strip()
             if not name:
@@ -354,6 +416,13 @@ class EvolutionEngine:
             patch = {k: str(v)[:120] for k, v in ch["set"].items() if k in allowed}
             if patch:
                 self.store.upsert_nation(self.world_id, name, updated_tick=tick, **patch)
+
+    def _entity_exists(self, kind: str, name: str) -> bool:
+        if not name:
+            return False
+        if kind == "nation":
+            return self.store.get_nation(self.world_id, name) is not None
+        return self.store.find_npc_by_name(self.world_id, name) is not None
 
     def _in_scope(self, node: dict, x: int, y: int) -> bool:
         return node["x"] <= x < node["x"] + node["w"] and node["y"] <= y < node["y"] + node["h"]

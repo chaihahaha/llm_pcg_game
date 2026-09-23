@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -178,6 +179,16 @@ class MockBackend:
         m = re.search(rf"\[\[{name}:(.*?)\]\]", self._text(messages))
         return m.group(1).strip() if m else default
 
+    def _scope(self, messages: List[dict]) -> tuple[int, int, int, int]:
+        """Parse the [[SCOPE:x,y,w,h]] marker so mock deltas land in world coords."""
+        m = re.search(r"\[\[SCOPE:(-?\d+),(-?\d+),(\d+),(\d+)\]\]", self._text(messages))
+        if not m:
+            return 0, 0, 16, 16
+        return tuple(int(g) for g in m.groups())  # type: ignore[return-value]
+
+    def _npc_names(self, messages: List[dict]) -> List[str]:
+        return re.findall(r"\[([^\]@,]+)@-?\d+,-?\d+,", self._text(messages))
+
     def _gen(self, task: str, messages: List[dict], seed: int) -> dict:
         fn = getattr(self, f"_t_{task}", None)
         if fn is None:
@@ -202,9 +213,19 @@ class MockBackend:
                 "capital_x": 100 + i * 160,
                 "capital_y": 90 + i * 140,
             })
+        relations = []
+        for i in range(len(nations)):
+            j = (i + 1) % len(nations)
+            relations.append({
+                "a": nations[i]["name"], "b": nations[j]["name"],
+                "kind": pick(["敌对", "盟友", "贸易", "冷战", "世仇"], seed, "rel", i),
+                "value": hash_int(seed, "v", i, mod=11) - 5,
+                "note": f"围绕{pick(['矿脉','水源','商路','圣地'], seed, 'rnote', i)}的长期争端。",
+            })
         return {
             "name": pick(names, seed, "wname"),
             "era": pick(["青铜纪", "铁火纪", "星陨纪"], seed, "era"),
+            "relations": relations,
             "cosmology": "世界由三枚沉眠的星核支撑，星核呼吸形成季节与魔力潮汐。",
             "magic_system": pick(magics, seed, "magic"),
             "tech_baseline": "铁器与水力机械并存，魔导装置稀有。",
@@ -270,6 +291,14 @@ class MockBackend:
                 {"x": 6, "y": 6, "name": pick(_MOCK_GIVEN, seed, "cn") + pick(_MOCK_SURNAME, seed, "cs"),
                  "race": pick(_MOCK_RACES, seed, "cr"), "role": pick(_MOCK_ROLES, seed, "crole"),
                  "personality": "多疑，但提到古代遗迹时话会变多。"},
+                {"x": 9, "y": 11, "name": pick(_MOCK_GIVEN, seed, "cn2") + pick(_MOCK_SURNAME, seed, "cs2"),
+                 "race": pick(_MOCK_RACES, seed, "cr2"), "role": pick(_MOCK_ROLES, seed, "crole2"),
+                 "personality": "寡言，习惯先观察再开口。"},
+            ],
+            "relations": [
+                {"a": pick(_MOCK_GIVEN, seed, "cn") + pick(_MOCK_SURNAME, seed, "cs"),
+                 "b": pick(_MOCK_GIVEN, seed, "cn2") + pick(_MOCK_SURNAME, seed, "cs2"),
+                 "kind": "雇主", "value": 2, "note": "一人雇另一人看守遗迹入口。"},
             ],
         }
 
@@ -288,14 +317,26 @@ class MockBackend:
 
     # -- evolution
     def _t_evolve_chunk(self, messages, seed) -> dict:
+        ox, oy, w, h = self._scope(messages)
+        names = self._npc_names(messages)
+        mx = ox + (w // 2 if w > 2 else 0)
+        my = oy + (h // 2 if h > 2 else 0)
+        changes: List[dict] = [
+            {"type": "new_object", "x": mx, "y": my, "kind": "track", "name": "兽径泥坑",
+             "desc": "新鲜翻起的泥土，边缘有蹄印。"},
+        ]
+        if names:
+            changes.append({"type": "memory", "name": names[0], "kind": "goal",
+                            "text": "我决定盯住那条新出现的兽径。"})
+        if len(names) >= 2:
+            changes.append({"type": "relation", "a_kind": "npc", "a_name": names[0],
+                            "b_kind": "npc", "b_name": names[1], "kind": "敌对",
+                            "value": -2, "note": "为争夺兽径上的猎物起了争执。"})
         return {
             "summary": "疏林边缘出现新的兽径，遗留下被翻动的土。",
             "weather": pick(["转阴", "落雨", "放晴", "起风"], seed, "w2"),
             "events": [{"kind": "wildlife", "text": "一头野猪在草甸上翻掘根部，留下泥坑。"}],
-            "changes": [
-                {"type": "new_object", "x": 5, "y": 7, "kind": "track", "name": "兽径泥坑",
-                 "desc": "新鲜翻起的泥土，边缘有蹄印。"},
-            ],
+            "changes": changes,
         }
 
     def _t_evolve_zone(self, messages, seed) -> dict:
@@ -328,6 +369,10 @@ class MockBackend:
                      "别走溪北的草甸，那里有东西在翻土。",
             "mood": "警惕",
             "action": "none",
+            "memories": [{"kind": "fact", "about": "守望塔",
+                          "text": "夜里塔顶有光，我亲眼见过两次。"}],
+            "relation_changes": [{"kind": "相识", "value": 1,
+                                  "note": "这个旅人愿意听我把话说完。"}],
         }
 
     def _t_story(self, messages, seed) -> dict:
@@ -356,6 +401,7 @@ class LLMClient:
         self.use_cache = bool(cfg_get(cfg, "llm.cache", True))
         self.default_max = int(cfg_get(cfg, "llm.max_tokens_out", 768))
         self.retries = int(cfg_get(cfg, "llm.retries", 2))
+        self.degraded = False
         self.backend_name = "mock" if self.mock else "http"
         self.backend = MockBackend() if self.mock else _HTTPBackend(cfg)
         self.stats = {"calls": 0, "cache_hits": 0, "mock_calls": 0, "errors": 0,
@@ -450,15 +496,35 @@ class LLMClient:
 
     def _invoke(self, messages, max_tokens, temperature, json_mode) -> tuple[str, str]:
         last_err: Optional[Exception] = None
+        budget = max_tokens
         for attempt in range(self.retries + 1):
             try:
-                return self.backend.chat(messages, max_tokens, temperature, json_mode)
+                return self.backend.chat(messages, budget, temperature, json_mode)
+            except urllib.error.HTTPError as exc:
+                # The server answered, so this is a request problem.  The usual
+                # cause is prompt+completion exceeding the context window, which
+                # shrinking the completion budget fixes.
+                last_err = exc
+                detail = ""
+                try:
+                    detail = exc.read().decode("utf-8", "replace")[:200]
+                except Exception:  # pragma: no cover
+                    pass
+                if self.logger:
+                    self.logger.error("llm HTTP %s: %s", exc.code, detail)
+                if exc.code == 400 and budget > 256:
+                    budget = max(256, budget // 2)
+                    if self.logger:
+                        self.logger.warning("retrying with max_tokens=%d", budget)
+                    continue
+                break
             except Exception as exc:  # noqa: BLE001 - transport agnostic
                 last_err = exc
-                if self.backend_name == "http" and self.auto_fallback and self._looks_like_connection_error(exc):
+                if (self.backend_name == "http" and self.auto_fallback
+                        and self._looks_like_connection_error(exc)):
                     self._switch_to_mock(str(exc))
                     try:
-                        return self.backend.chat(messages, max_tokens, temperature, json_mode)
+                        return self.backend.chat(messages, budget, temperature, json_mode)
                     except Exception as exc2:  # pragma: no cover
                         last_err = exc2
                 if self.logger:
@@ -469,13 +535,30 @@ class LLMClient:
 
     def _switch_to_mock(self, reason: str) -> None:
         self.mock = True
+        self.degraded = True
         self.backend_name = "mock"
         self.backend = MockBackend()
         if self.logger:
-            self.logger.warning("LLM unreachable (%s) — falling back to deterministic MockBackend", reason)
+            self.logger.error(
+                "LLM unreachable (%s) — DEGRADED: falling back to the deterministic MockBackend; "
+                "content from here on is fabricated and must not be mistaken for model output",
+                reason)
 
     @staticmethod
     def _looks_like_connection_error(exc: Exception) -> bool:
-        if isinstance(exc, (urllib.error.URLError, ConnectionError, TimeoutError, OSError)):
+        """True only for genuine transport failures.
+
+        ``HTTPError`` is a subclass of ``URLError`` which is a subclass of
+        ``OSError``, so a naive isinstance check would treat *any* server error
+        (e.g. 400 context-overflow) as "unreachable" and silently swap in the
+        Mock backend — replacing real generated content with fabricated data.
+        A server that answered is by definition reachable.
+        """
+        if isinstance(exc, urllib.error.HTTPError):
+            return False
+        if isinstance(exc, (urllib.error.URLError, ConnectionError, socket.timeout, TimeoutError)):
             return True
-        return "refused" in str(exc).lower() or "timed out" in str(exc).lower()
+        if isinstance(exc, OSError):
+            text = str(exc).lower()
+            return "refused" in text or "timed out" in text or "unreachable" in text
+        return False

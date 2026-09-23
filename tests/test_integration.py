@@ -1,6 +1,7 @@
 """Mock-backed end-to-end tests for the LOD tree, evolution and REPL."""
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import unittest
@@ -151,12 +152,14 @@ class TestEvolution(unittest.TestCase):
         # force every LOD overdue
         self.engine.advance(1, 8, 8)
         tick = self.store.get_meta("tick") + 5000
-        scopes = self.engine._due_scopes(tick, 8, 8)
-        self.assertTrue(scopes)
-        lods = [lod for lod, _ in scopes]
+        plan = self.engine._plan(tick, 8, 8)
+        self.assertTrue(plan)
+        lods = [lod for lod, _, _, _ in plan]
         self.assertEqual(lods, sorted(lods), "higher LODs must evolve before local ones")
         self.assertIn(LOD_WORLD, lods)
         self.assertIn(LOD_CHUNK, lods)
+        # every entry carries an overdue step count and an elapsed-hours figure
+        self.assertTrue(all(steps >= 1 and elapsed >= 1 for _, _, steps, elapsed in plan))
 
     def test_node_summary_updated(self):
         before = self.wm.ensure_node(LOD_CHUNK, 0, 0)["summary"]
@@ -166,6 +169,101 @@ class TestEvolution(unittest.TestCase):
         self.assertIsInstance(after, str)
         self.assertTrue(after)
         self.assertNotEqual(before, "")  # generated summary exists either way
+
+
+class TestContinuity(unittest.TestCase):
+    """The world must keep living where the player is not, and must not forget."""
+
+    def setUp(self):
+        self.cfg = test_cfg(evolution={"max_llm_calls_per_wait": 6, "max_catchup_calls": 10,
+                                       "max_chunk_scopes_per_advance": 2})
+        self.store = Store(db_path("test_continuity.db"))
+        self.llm = LLMClient(self.cfg, store=self.store,
+                             logger=logging.getLogger("pcg.test"))
+        self.wm = WorldManager(self.store, self.llm, self.cfg)
+        self.wm.create(seed=99)
+        self.engine = EvolutionEngine(self.store, self.llm, self.cfg, self.wm)
+
+    def tearDown(self):
+        self.store.close()
+
+    def test_far_scopes_still_evolve(self):
+        """A chunk 240 tiles away must not be frozen while the player is elsewhere."""
+        near = self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        far = self.wm.ensure_node(LOD_CHUNK, 240, 240)
+        self.engine.advance(1, 8, 8)
+        self.engine.advance(200, 8, 8)  # player stays at the near chunk
+        after = self.store.get_node_by_id(far["id"])
+        self.assertGreater(after["updated_tick"], far["updated_tick"],
+                           "a scope far from the player was never evolved (world froze)")
+        self.assertGreater(self.store.get_node_by_id(near["id"])["updated_tick"], 0)
+
+    def test_catchup_is_summarised_not_stepped(self):
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        self.engine.advance(1, 8, 8)
+        calls_before = self.llm.stats["calls"]
+        self.engine.advance(600, 8, 8)  # 100 chunk periods in one go
+        used = self.llm.stats["calls"] - calls_before
+        self.assertLessEqual(used, self.engine.max_catchup_calls,
+                             "a long absence must cost a bounded number of calls")
+
+    def test_dead_npc_stays_dead_and_hp_is_bounded(self):
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        npcs = self.store.npcs_near(self.wm.world_id, 8, 8, 16)
+        self.assertTrue(npcs, "mock chunk should spawn NPCs")
+        npc = npcs[0]
+        self.store.update_npc(npc["id"], alive=0, hp=0)
+        self.store.update_npc(npcs[-1]["id"], hp=9999)
+        self.engine.advance(1, 8, 8)
+        self.engine.advance(300, 8, 8)
+        dead = self.store.get_npc(npc["id"])
+        self.assertEqual(dead["alive"], 0, "a dead NPC was revived")
+        self.assertEqual(dead["hp"], 0)
+
+    def test_destroyed_object_is_kept_as_history(self):
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        objs = self.store.objects_near(self.wm.world_id, 8, 8, 16)
+        self.assertTrue(objs)
+        oid = objs[0]["id"]
+        self.store.destroy_object(oid, tick=5, desc="只剩焦黑的残桩。")
+        row = self.store.get_object(oid)
+        self.assertIsNotNone(row, "destroyed objects must be kept for history")
+        self.assertEqual(row["alive"], 0)
+        self.assertNotIn(oid, [o["id"] for o in self.store.objects_near(self.wm.world_id, 8, 8, 16)])
+
+    def test_talk_persists_memory_and_player_relation(self):
+        from pcg.entities import Player
+        from pcg.narrative import Narrator
+
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        self.store.create_player(self.wm.world_id, "旅人", 8, 8, 30, 5, 2)
+        player = Player(self.store, self.wm.world_id)
+        npc = self.store.npcs_near(self.wm.world_id, 8, 8, 16, limit=1)[0]
+        narrator = Narrator(self.store, self.llm, self.cfg, self.wm)
+
+        narrator.talk(player, npc, "你好，你在这里做什么？")
+        self.assertTrue(narrator.npc_memory_digest(npc),
+                        "dialogue must leave the NPC with a persistent memory")
+        rels = self.store.relations_for(self.wm.world_id, "npc", npc["name"])
+        self.assertTrue(any(r["other_kind"] == "player" for r in rels),
+                        "talking should create an npc->player relation edge")
+
+        # a second conversation must see the first one's memory in its prompt
+        text = narrator.npc_memory_digest(npc)
+        self.assertIn("守望塔", text)
+
+    def test_nation_relations_are_seeded(self):
+        rels = self.store.list_relations(self.wm.world_id, kind="nation")
+        self.assertTrue(rels, "world genesis should produce a diplomacy graph")
+        self.assertTrue(all(r["a_kind"] == "nation" for r in rels))
+
+    def test_relations_and_memories_are_queried_both_ways(self):
+        self.store.upsert_relation(self.wm.world_id, "npc", "甲", "npc", "乙",
+                                   "盟友", 3, "一起打猎", 1)
+        for name in ("甲", "乙"):
+            rels = self.store.relations_for(self.wm.world_id, "npc", name)
+            self.assertTrue(rels, f"{name} should see the edge")
+            self.assertEqual(rels[0]["other_name"], "乙" if name == "甲" else "甲")
 
 
 class TestGameREPL(unittest.TestCase):

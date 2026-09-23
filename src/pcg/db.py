@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS objects (
     name TEXT DEFAULT '',
     desc TEXT DEFAULT '',
     solid INTEGER DEFAULT 0,
+    alive INTEGER DEFAULT 1,
     hp INTEGER DEFAULT 0,
     hp_max INTEGER DEFAULT 0,
     state_json TEXT DEFAULT '{}',
@@ -127,6 +128,38 @@ CREATE TABLE IF NOT EXISTS nations (
     updated_tick INTEGER DEFAULT 0,
     UNIQUE(world_id, name)
 );
+
+-- Relationship graph: nation<->nation, npc<->npc, npc<->faction (and later
+-- creature/item).  Edges carry a signed value so they can decay and flip.
+CREATE TABLE IF NOT EXISTS relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    world_id INTEGER NOT NULL,
+    a_kind TEXT NOT NULL,
+    a_name TEXT NOT NULL,
+    b_kind TEXT NOT NULL,
+    b_name TEXT NOT NULL,
+    kind TEXT DEFAULT '中立',
+    value INTEGER DEFAULT 0,
+    note TEXT DEFAULT '',
+    updated_tick INTEGER DEFAULT 0,
+    UNIQUE(world_id, a_kind, a_name, b_kind, b_name)
+);
+CREATE INDEX IF NOT EXISTS idx_rel_a ON relations(world_id, a_kind, a_name);
+CREATE INDEX IF NOT EXISTS idx_rel_b ON relations(world_id, b_kind, b_name);
+
+-- What an NPC knows.  This is the anti-amnesia ledger: dialogue and evolution
+-- append here, and the dialogue prompt reads it back, so an NPC cannot calmly
+-- contradict what it said or did three days ago.
+CREATE TABLE IF NOT EXISTS npc_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    world_id INTEGER NOT NULL,
+    npc_id INTEGER NOT NULL,
+    tick INTEGER DEFAULT 0,
+    kind TEXT DEFAULT 'fact',
+    about TEXT DEFAULT '',
+    text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mem_npc ON npc_memory(npc_id, id);
 
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -259,6 +292,15 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a save was created (CREATE IF NOT EXISTS
+        does not alter existing tables)."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(objects)")}
+        if "alive" not in cols:
+            self.conn.execute("ALTER TABLE objects ADD COLUMN alive INTEGER DEFAULT 1")
+            self.conn.commit()
 
     def close(self) -> None:
         try:
@@ -394,6 +436,11 @@ class Store:
         ).fetchall()
         return [self._node(r) for r in rows]
 
+    def nodes_of_lod(self, world_id: int, lod: int) -> List[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM nodes WHERE world_id=? AND lod=? ORDER BY id", (world_id, lod)).fetchall()
+        return [self._node(r) for r in rows]
+
     def count_nodes(self, world_id: int, lod: int | None = None) -> int:
         if lod is None:
             row = self.conn.execute("SELECT COUNT(*) c FROM nodes WHERE world_id=?", (world_id,)).fetchone()
@@ -468,21 +515,29 @@ class Store:
         self.commit()
         return int(cur.lastrowid)
 
-    def objects_at(self, world_id: int, x: int, y: int) -> List[dict]:
-        rows = self.conn.execute(
-            "SELECT * FROM objects WHERE world_id=? AND x=? AND y=? ORDER BY id", (world_id, x, y)
-        ).fetchall()
+    def get_object(self, obj_id: int) -> Optional[dict]:
+        row = self.conn.execute("SELECT * FROM objects WHERE id=?", (obj_id,)).fetchone()
+        return self._obj(row) if row else None
+
+    def objects_at(self, world_id: int, x: int, y: int, alive_only: bool = True) -> List[dict]:
+        q = "SELECT * FROM objects WHERE world_id=? AND x=? AND y=?"
+        if alive_only:
+            q += " AND alive=1"
+        rows = self.conn.execute(q + " ORDER BY id", (world_id, x, y)).fetchall()
         return [self._obj(r) for r in rows]
 
-    def objects_near(self, world_id: int, x: int, y: int, r: int, limit: int = 50) -> List[dict]:
-        rows = self.conn.execute(
-            "SELECT * FROM objects WHERE world_id=? AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? ORDER BY id LIMIT ?",
-            (world_id, x - r, x + r, y - r, y + r, limit),
-        ).fetchall()
+    def objects_near(self, world_id: int, x: int, y: int, r: int, limit: int = 50,
+                     alive_only: bool = True) -> List[dict]:
+        q = ("SELECT * FROM objects WHERE world_id=? AND x BETWEEN ? AND ? AND y BETWEEN ? AND ?")
+        if alive_only:
+            q += " AND alive=1"
+        rows = self.conn.execute(q + " ORDER BY id LIMIT ?",
+                                 (world_id, x - r, x + r, y - r, y + r, limit)).fetchall()
         return [self._obj(r) for r in rows]
 
     def update_object(self, obj_id: int, **fields) -> None:
-        allowed = {"kind", "name", "desc", "solid", "hp", "hp_max", "updated_tick", "x", "y"}
+        allowed = {"kind", "name", "desc", "solid", "hp", "hp_max", "updated_tick", "x", "y",
+                   "alive"}
         sets, vals = [], []
         for k, v in fields.items():
             if k in allowed:
@@ -498,6 +553,25 @@ class Store:
 
     def delete_object(self, obj_id: int) -> None:
         self.conn.execute("DELETE FROM objects WHERE id=?", (obj_id,))
+
+    def destroy_object(self, obj_id: int, tick: int = 0, desc: str = "") -> None:
+        """Soft delete: keep the row so the history stays inspectable.
+
+        A felled tree should leave a stump the player can still look at, not a
+        hole in the record.
+        """
+        obj = self.get_object(obj_id)
+        if not obj:
+            return
+        state = dict(obj.get("state") or {})
+        state["destroyed"] = True
+        state["destroyed_tick"] = tick
+        if obj.get("desc"):
+            state["last_desc"] = obj["desc"]
+        self.conn.execute(
+            "UPDATE objects SET alive=0, hp=0, desc=?, state_json=?, updated_tick=? WHERE id=?",
+            (desc or f"（{obj['name']}的残迹）", _dumps(state), tick, obj_id),
+        )
 
     @staticmethod
     def _obj(row: sqlite3.Row) -> dict:
@@ -623,6 +697,106 @@ class Store:
                 return n
         return None
 
+    # ------------------------------------------------------------- relations
+    def upsert_relation(self, world_id: int, a_kind: str, a_name: str, b_kind: str, b_name: str,
+                        kind: str = "中立", value: int = 0, note: str = "",
+                        tick: int = 0) -> None:
+        if not a_name or not b_name or (a_kind, a_name) == (b_kind, b_name):
+            return
+        kind = (kind or "中立")[:16]
+        value = max(-5, min(5, int(value)))
+        row = self.conn.execute(
+            "SELECT id, note FROM relations WHERE world_id=? AND a_kind=? AND a_name=?"
+            " AND b_kind=? AND b_name=?",
+            (world_id, a_kind, a_name, b_kind, b_name),
+        ).fetchone()
+        if row:
+            merged_note = note or row["note"]
+            self.conn.execute(
+                "UPDATE relations SET kind=?, value=?, note=?, updated_tick=? WHERE id=?",
+                (kind, value, merged_note[:160], tick, row["id"]),
+            )
+        else:
+            self.conn.execute(
+                "INSERT INTO relations(world_id,a_kind,a_name,b_kind,b_name,kind,value,note,updated_tick)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (world_id, a_kind, a_name[:32], b_kind, b_name[:32], kind, value, note[:160], tick),
+            )
+
+    def list_relations(self, world_id: int, kind: str | None = None,
+                       name: str | None = None, limit: int = 200) -> List[dict]:
+        q = "SELECT * FROM relations WHERE world_id=?"
+        params: List[Any] = [world_id]
+        if kind:
+            q += " AND (a_kind=? OR b_kind=?)"
+            params += [kind, kind]
+        if name:
+            q += " AND (a_name=? OR b_name=?)"
+            params += [name, name]
+        q += " ORDER BY id LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self.conn.execute(q, params).fetchall()]
+
+    def relations_for(self, world_id: int, ref_kind: str, ref_name: str,
+                      limit: int = 20) -> List[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM relations WHERE world_id=? AND ((a_kind=? AND a_name=?)"
+            " OR (b_kind=? AND b_name=?)) ORDER BY ABS(value) DESC, id LIMIT ?",
+            (world_id, ref_kind, ref_name, ref_kind, ref_name, limit),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            # present the edge from the queried node's point of view
+            if d["a_kind"] == ref_kind and d["a_name"] == ref_name:
+                d["other_kind"], d["other_name"], d["outward"] = d["b_kind"], d["b_name"], True
+            else:
+                d["other_kind"], d["other_name"], d["outward"] = d["a_kind"], d["a_name"], False
+            out.append(d)
+        return out
+
+    def count_relations(self, world_id: int) -> int:
+        return int(self.conn.execute(
+            "SELECT COUNT(*) c FROM relations WHERE world_id=?", (world_id,)).fetchone()["c"])
+
+    # ---------------------------------------------------------------- memory
+    def add_memory(self, world_id: int, npc_id: int, tick: int, kind: str, text: str,
+                   about: str = "") -> None:
+        text = (text or "").strip()
+        if not text or not npc_id:
+            return
+        self.conn.execute(
+            "INSERT INTO npc_memory(world_id,npc_id,tick,kind,about,text) VALUES(?,?,?,?,?,?)",
+            (world_id, npc_id, tick, (kind or "fact")[:16], (about or "")[:32], text[:200]),
+        )
+
+    def npc_memories(self, npc_id: int, limit: int = 12, kinds: Sequence[str] | None = None) -> List[dict]:
+        q = "SELECT * FROM npc_memory WHERE npc_id=?"
+        params: List[Any] = [npc_id]
+        if kinds:
+            q += " AND kind IN (%s)" % ",".join("?" * len(kinds))
+            params += list(kinds)
+        q += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in reversed(self.conn.execute(q, params).fetchall())]
+
+    def count_memories(self, world_id: int) -> int:
+        return int(self.conn.execute(
+            "SELECT COUNT(*) c FROM npc_memory WHERE world_id=?", (world_id,)).fetchone()["c"])
+
+    def prune_memories(self, npc_id: int, keep: int = 12) -> None:
+        """Keep ``keep`` recent memories; older ones are condensed by
+        ``Narrator.consolidate_memories`` before they reach this point."""
+        self.conn.execute(
+            "DELETE FROM npc_memory WHERE npc_id=? AND id NOT IN"
+            " (SELECT id FROM npc_memory WHERE npc_id=? ORDER BY id DESC LIMIT ?)",
+            (npc_id, npc_id, keep),
+        )
+
+    def memory_count(self, npc_id: int) -> int:
+        return int(self.conn.execute(
+            "SELECT COUNT(*) c FROM npc_memory WHERE npc_id=?", (npc_id,)).fetchone()["c"])
+
     # ---------------------------------------------------------------- events
     def add_event(self, world_id: int, tick: int, lod: int, node_id: Optional[int],
                   x: int, y: int, kind: str, summary: str, data: dict | None = None) -> int:
@@ -691,10 +865,15 @@ class Store:
         return [dict(r) for r in reversed(rows)]
 
     def prune_dialogue(self, world_id: int, keep_per_npc: int = 40) -> None:
+        """Per-NPC window, so a chatty NPC cannot erase another one's history."""
         self.conn.execute(
-            "DELETE FROM dialogue WHERE world_id=? AND id NOT IN"
-            " (SELECT id FROM dialogue WHERE world_id=? ORDER BY id DESC LIMIT ?)",
-            (world_id, world_id, keep_per_npc * 20),
+            "DELETE FROM dialogue WHERE world_id=? AND id NOT IN ("
+            "  SELECT id FROM ("
+            "    SELECT id, ROW_NUMBER() OVER (PARTITION BY npc_id ORDER BY id DESC) rn"
+            "    FROM dialogue WHERE world_id=?"
+            "  ) WHERE rn <= ?"
+            ")",
+            (world_id, world_id, keep_per_npc),
         )
 
     # ----------------------------------------------------------------- story

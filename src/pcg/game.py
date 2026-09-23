@@ -99,6 +99,21 @@ class Game:
     def save(self) -> None:
         self.store.commit()
 
+    def teleport(self, x: int, y: int) -> None:
+        """Move the player without generating the intervening map.
+
+        Used by tests/QA to exercise "walk far away, come back" without paying
+        for dozens of chunk generations, and handy for debugging.
+        """
+        assert self.player is not None
+        half = self.view_size // 2
+        self.wm.ensure_area(x - half, y - half, x - half + self.view_size - 1,
+                            y - half + self.view_size - 1)
+        self.store.update_player(self.world_id, x=x, y=y, updated_tick=self.tick())
+        self.player.refresh()
+        self.wm.mark_explored(x, y)
+        self.save()
+
     def close(self) -> None:
         try:
             self.store.commit()
@@ -395,6 +410,8 @@ class Game:
         stats = self.store.stats(self.world_id)
         print(f"世界数据库：节点{stats['nodes']} 格子{stats['tiles']} 物体{stats['objects']} "
               f"NPC{stats['npcs']} 事件{stats['events']} 国家{stats['nations']}")
+        if self.llm.degraded:
+            print("⚠ LLM 已降级为 Mock 后端：此后内容为虚构模拟，不是模型输出！")
         print(f"LLM：后端 {self.llm.backend_name}｜实调 {self.llm.stats['calls']}｜"
               f"缓存命中 {self.llm.stats['cache_hits']}｜估算输入 {self.llm.stats['prompt_tokens']} tok｜"
               f"输出 {self.llm.stats['completion_tokens']} tok")
