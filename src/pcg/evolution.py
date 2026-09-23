@@ -150,8 +150,14 @@ class EvolutionEngine:
 
         if mode == "local":
             return higher + chunks
+        # A short wait should not pay for every chunk on the map.  Only when a
+        # scope is genuinely behind (several periods overdue) do we spend the
+        # larger catch-up budget on the rest.
         local_budget = int(cfg_get(self.cfg, "evolution.max_chunk_scopes_per_advance", 2))
-        return higher + chunks[:local_budget] + chunks[local_budget:]
+        behind = any(steps >= self.catchup_steps for _, _, steps, _ in chunks)
+        if not behind:
+            return higher + chunks[:local_budget]
+        return higher + chunks
 
     # ---------------------------------------------------------------- scoping
     def evolve_scope(self, lod: int, node: dict, tick: int, px: int, py: int,
