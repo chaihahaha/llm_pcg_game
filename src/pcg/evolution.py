@@ -29,7 +29,7 @@ from .terrain import normalize
 from .tokens import estimate_tokens
 from .world import LOD_CHUNK, LOD_NAMES, LOD_REGION, LOD_WORLD, LOD_ZONE, WorldManager
 
-_MAX_TOKEN_TASKS = 2200
+_MAX_TOKEN_TASKS = 3600
 
 
 class EvolutionEngine:
@@ -220,7 +220,7 @@ class EvolutionEngine:
             inside = [o for o in objs if cx <= o["x"] < cx + 16 and cy <= o["y"] < cy + 16]
             others = [o for o in objs if o not in inside]
             picks = (inside[: self.max_neighbors] + others[: max(0, self.max_neighbors - len(inside))])
-            npcs = self.store.npcs_near(self.world_id, cx + 8, cy + 8, 12, limit=8)
+            npcs = self.store.npcs_near(self.world_id, cx + 8, cy + 8, 12, limit=6)
             parts = []
             if picks:
                 parts.append("物体：" + "；".join(
@@ -475,7 +475,7 @@ class EvolutionEngine:
         prior = self.store.events_mentioning(self.world_id, n["name"], limit=2)
         if prior:
             line += "。近事：" + "；".join(e["summary"][:44] for e in prior)
-        return line
+        return line[:220]
 
     def _entity_exists(self, kind: str, name: str) -> bool:
         if not name:
@@ -514,15 +514,20 @@ class EvolutionEngine:
 
     # ---------------------------------------------------------------- helpers
     def _fit_budget(self, prompt_text: str) -> str:
+        """Trim the middle (the digests) but never the tail (the output schema).
+
+        Dropping from the end used to cut off the JSON contract and the
+        world-coordinate rule, which is far worse than losing a few neighbours.
+        """
         if estimate_tokens(prompt_text) <= _MAX_TOKEN_TASKS:
             return prompt_text
-        # crude but safe: drop the neighbour section lines until it fits
         lines = prompt_text.split("\n")
+        tail = lines[-6:]
         out: List[str] = []
-        for line in lines:
+        for line in lines[:-6]:
             out.append(line)
-            if estimate_tokens("\n".join(out)) > _MAX_TOKEN_TASKS:
+            if estimate_tokens("\n".join(out + tail)) > _MAX_TOKEN_TASKS:
                 out.pop()
-                out.append("…（上下文过长已省略）")
+                out.append("…（上下文过长，已省略部分邻接信息）")
                 break
-        return "\n".join(out)
+        return "\n".join(out + tail)

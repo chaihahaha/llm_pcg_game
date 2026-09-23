@@ -43,6 +43,7 @@ python3 main.py --new --mock --script scripts/demo.txt
 | `wait [小时]` | 原地等待，推进世界演化 |
 | `story` / `newstory` | 查看 / 立即生成任务线 |
 | `journal [n]` | 最近事件（含世界级大事） |
+| `talk` 时 NPC 会记住你 | 每个 NPC 有长期记忆账本（`npc_memory`），超限时由 LLM 压缩而非丢弃 |
 | `world` | 世界圣经（国家 / 魔法 / 科技） |
 | `stats` | 数据库规模与 LLM 调用/缓存统计 |
 | `auto <n>` | 自动探索 n 步 |
@@ -77,9 +78,18 @@ docs/DESIGN.md          架构与上下文预算策略
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v   # 32 个用例，全部走 Mock，零网络
+python3 -m unittest discover -s tests -v   # 50 个用例，全部走 Mock，零网络
 python3 scripts/smoke_test.py              # 端到端冒烟
+
+# 长跑一致性 QA：探索 A -> 远行 B -> 时间流逝 -> 返回 A，检查世界是否"活着"且自洽
+python3 scripts/qa_consistency.py --mock                       # 秒级，查结构性缺陷
+python3 scripts/qa_consistency.py --hours 200 --audit --report outputs/qa.md
+python3 scripts/qa_consistency.py --audit-only --db data/qa.db  # 只对已有存档做 LLM 审计
 ```
+
+QA 会检查：物体身份是否保持、被毁物是否留下残迹、死者是否复活、NPC 是否瞬移、
+是否重名、已描述格子是否失忆、各 LOD 节点是否推进、关系边与 NPC 记忆是否存在；
+`--audit` 还会让模型通读档案，报告逻辑矛盾 / 失忆 / 与历史冲突（带证据与严重度）。
 
 ## 配置要点
 
