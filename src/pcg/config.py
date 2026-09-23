@@ -45,7 +45,7 @@ DEFAULTS: Dict[str, Any] = {
         "distance_scaling": True,
         "neighbor_radius": 6,
         "max_neighbors": 12,
-        "max_local_events": 8,
+        "max_local_events": 14,
         "max_higher_events": 6,
     },
     "context": {

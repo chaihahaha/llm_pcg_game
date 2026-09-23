@@ -148,7 +148,8 @@ def tile_task(seed: int, tile: Dict[str, Any], zone_name: str, chunk_summary: st
 def evolve_task(lod_name: str, seed: int, scope_desc: str, local_digest: str,
                 higher_digest: str, neighbor_digest: str, hour: int, day: int,
                 allow_tiles: bool, elapsed_hours: int = 0, period_hours: int = 0,
-                bbox: Tuple[int, int, int, int] | None = None) -> str:
+                bbox: Tuple[int, int, int, int] | None = None,
+                scope_history: str = "") -> str:
     tile_rule = (
         "允许 type=tile 修改单格地形（谨慎使用，最多 1 处）。"
         if allow_tiles else "不要修改单格地形。"
@@ -174,12 +175,15 @@ def evolve_task(lod_name: str, seed: int, scope_desc: str, local_digest: str,
         f"当前时间：第 {day} 天 第 {hour} 时。\n"
         f"{leap}"
         f"【本层对象】{scope_desc}\n"
+        f"【本层往事（你此前概括的长期走向，必须承接，不得当作没发生）】{scope_history or '（还没有）'}\n"
         f"【本层近期历史】{local_digest or '无'}\n"
         f"【更高层级(LOD 更高)的演化结果】{higher_digest or '无'}\n"
         f"【相邻对象现状】{neighbor_digest or '无'}\n"
         "请推演本层下一个时间步的变化。必须与更高层级的历史走向自洽（例如高层的战争/灾荒/魔力潮汐"
         "应当在这里留下痕迹）。变化要小而具体，避免每步都发生剧变。输出 JSON："
-        '{"summary":"更新后的本层概要(30-80字)","weather":"天气(可为空字符串)",'
+        '{"summary":"更新后的本层概要(30-80字)","history":"更新后的本层往事摘要(60-150字，'
+        '承接已有往事、保留尚未解决的事与已离场/已解散的组织，只做滚动合并)",'
+        '"weather":"天气(可为空字符串)",'
         '"events":[{"kind":"politics|economy|magic|weather|wildlife|conflict|discovery","text":"事件描述(20-50字)"}],'
         '"changes":[{"type":"new_object","x":整数,"y":整数,"kind":"物体类型","name":"名称","desc":"描述"},'
         '{"type":"new_npc","x":整数,"y":整数,"name":"人名","race":"民族","role":"身份","personality":"性格"},'
@@ -195,6 +199,11 @@ def evolve_task(lod_name: str, seed: int, scope_desc: str, local_digest: str,
         "不要使用 0-15 之类的地块内局部坐标；越界的改动会被丢弃。"
         "relation / memory 里出现的名字必须是【本层对象】或【相邻对象现状】里已有的名字，不要发明新名字。"
         "关系变化要克制：没有明确事件支撑就不要改动关系。"
+        "★ NPC 的 name/race/role/appearance 是身份，**任何情况下都不得更改**；"
+        "填入 memory 的内容必须与该 NPC 的身份与既往经历一致（不要一会儿是矿商一会儿是情报贩子）。"
+        "★ 已经撤离、死亡、解散、被摧毁的人或组织，不得在后续事件里当作仍在此地正常活动；"
+        "若要重新登场，必须先用 new_npc/new_object 说明其如何回来。"
+        "★ 描述新物体时不得与其所在坐标的地形/既有物体矛盾（不要把一个东西说成在别处）。"
     )
 
 

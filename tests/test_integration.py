@@ -8,6 +8,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
+from pcg import prompts  # noqa: E402
 from pcg.config import load_config  # noqa: E402
 from pcg.db import Store  # noqa: E402
 from pcg.evolution import EvolutionEngine  # noqa: E402
@@ -310,6 +311,35 @@ class TestContinuity(unittest.TestCase):
         narrator = Narrator(self.store, self.llm, self.cfg, self.wm)
         narrator.talk(player, self.store.get_npc(npc["id"]), "你还好吗？")
         self.assertTrue(narrator.npc_history_digest(self.store.get_npc(npc["id"])) is not None)
+
+    def test_scope_history_is_kept_and_fed_back(self):
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        node = self.store.get_node(self.wm.world_id, LOD_CHUNK, 0, 0)
+        self.engine._apply(3, node, 10, {"history": "沃克小队因辐射病撤离，封锁线废弃。",
+                                         "events": []})
+        after = self.store.get_node(self.wm.world_id, LOD_CHUNK, 0, 0)
+        self.assertIn("沃克小队", after["data"]["history"])
+        text = prompts.evolve_task("chunk", 1, "d", "", "", "", 1, 1, True,
+                                   bbox=(0, 0, 16, 16),
+                                   scope_history=after["data"]["history"])
+        self.assertIn("沃克小队", text, "long-term scope history must reach the prompt")
+
+    def test_new_object_replaces_a_remnant_instead_of_stacking(self):
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        node = self.store.get_node(self.wm.world_id, LOD_CHUNK, 0, 0)
+        oid = self.store.add_object(self.wm.world_id, 4, 4, "ruin", "倒塌的哨塔", "残破。")
+        self.store.destroy_object(oid, tick=3, desc="只剩基座。")
+        self.assertEqual(len(self.store.objects_at(self.wm.world_id, 4, 4)), 0)
+
+        self.engine._apply(3, node, 20, {"changes": [
+            {"type": "new_object", "x": 4, "y": 4, "kind": "building",
+             "name": "新建哨塔", "desc": "在旧基座上重建。"}]})
+        rows = self.store.objects_at(self.wm.world_id, 4, 4)
+        self.assertEqual(len(rows), 1, "a new object must not stack on a remnant")
+        self.assertEqual(rows[0]["id"], oid, "the row (and its history) should be reused")
+        self.assertEqual(rows[0]["alive"], 1)
+        self.assertEqual((rows[0]["x"], rows[0]["y"]), (4, 4))
+        self.assertNotIn("destroyed", rows[0]["state"])
 
     def test_nation_relations_are_seeded(self):
         rels = self.store.list_relations(self.wm.world_id, kind="nation")

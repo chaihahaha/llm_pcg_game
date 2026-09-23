@@ -25,9 +25,9 @@ from .config import cfg_get
 from .db import Store
 from .llm import LLMClient
 from .rng import hash_int, hash_unit
-from .terrain import normalize
+from .terrain import normalize, normalize_kind
 from .tokens import estimate_tokens
-from .world import LOD_CHUNK, LOD_NAMES, LOD_REGION, LOD_WORLD, LOD_ZONE, WorldManager
+from .world import LOD_CHUNK, LOD_NAMES, LOD_REGION, LOD_WORLD, LOD_ZONE, WorldManager, _field
 
 _MAX_TOKEN_TASKS = 3600
 
@@ -51,7 +51,7 @@ class EvolutionEngine:
         self.max_calls = int(cfg_get(cfg, "evolution.max_llm_calls_per_wait", 4))
         self.near_radius = int(cfg_get(cfg, "evolution.neighbor_radius", 6))
         self.max_neighbors = int(cfg_get(cfg, "evolution.max_neighbors", 12))
-        self.max_local_events = int(cfg_get(cfg, "evolution.max_local_events", 8))
+        self.max_local_events = int(cfg_get(cfg, "evolution.max_local_events", 14))
         self.max_higher_events = int(cfg_get(cfg, "evolution.max_higher_events", 6))
         self.max_prompt_tokens = int(cfg_get(cfg, "context.max_prompt_tokens", 24000))
         self.catchup_steps = int(cfg_get(cfg, "evolution.catchup_steps", 3))
@@ -149,7 +149,8 @@ class EvolutionEngine:
                                    higher_digest, neighbor_digest, hour, day, allow_tiles,
                                    elapsed_hours=elapsed_hours,
                                    period_hours=self.schedule[lod],
-                                   bbox=(node["x"], node["y"], node["w"], node["h"]))
+                                   bbox=(node["x"], node["y"], node["w"], node["h"]),
+                                   scope_history=str((node.get("data") or {}).get("history", ""))[:400])
         text = self._fit_budget(text)
         msgs = prompts.build(self.wm.world_bible(), text)
         data = self.llm.json(msgs, task=task, default={})
@@ -252,6 +253,17 @@ class EvolutionEngine:
         node_data = dict(node.get("data") or {})
         if weather and lod == LOD_CHUNK:
             node_data["weather"] = weather[:20]
+        # A rolling per-scope memory.  The shared event table is truncated to a
+        # window, so without this the model re-runs resolved beats ("the squad
+        # withdrew" on day 5, "the squad is here" on day 9).
+        history = str(_field(data, "history", "past", "chronicle", default="")).strip()
+        ev_texts = [str(ev.get("text", "")).strip() for ev in (data.get("events") or [])
+                    if isinstance(ev, dict) and str(ev.get("text", "")).strip()]
+        if history:
+            node_data["history"] = history[:400]
+        elif ev_texts:
+            merged = (node_data.get("history", "") + "；" + "；".join(ev_texts)).strip("；")
+            node_data["history"] = merged[-400:]
         changes = data.get("changes") if isinstance(data.get("changes"), list) else []
 
         # one evolution step is a step: an NPC may not cross the map in it
@@ -303,9 +315,27 @@ class EvolutionEngine:
             x, y = int(ch.get("x", -1)), int(ch.get("y", -1))
             if not self._in_scope(node, x, y):
                 return
-            otype = str(ch.get("kind", "object"))[:16]
-            self.store.add_object(self.world_id, x, y, otype, str(ch.get("name", ""))[:30],
-                                  str(ch.get("desc", ""))[:200], tick=tick)
+            otype = normalize_kind(str(ch.get("kind", "object")))
+            name = str(ch.get("name", ""))[:30]
+            desc = str(ch.get("desc", ""))[:200]
+            # If something already died on this tile, transform that row instead
+            # of stacking a second entity on it — otherwise the same coordinate
+            # ends up holding both "the ruins of X" and "an active Y".
+            remnant = next((o for o in self.store.objects_at(self.world_id, x, y, alive_only=False)
+                            if not o.get("alive")), None)
+            if remnant is not None:
+                state = dict(remnant.get("state") or {})
+                state.pop("destroyed", None)
+                state["transformed_from"] = remnant["name"]
+                state["last_desc"] = remnant.get("desc", "")
+                self.store.update_object(
+                    remnant["id"], alive=1, name=name or remnant["name"], kind=otype,
+                    desc=desc or f"{remnant['name']}变化而来。", hp=0, state=state,
+                    updated_tick=tick)
+                self.store.add_event(self.world_id, tick, lod, node["id"], x, y, "transformation",
+                                     f"{remnant['name']}演变为{name or otype}")
+                return
+            self.store.add_object(self.world_id, x, y, otype, name, desc, tick=tick)
 
         elif kind == "new_npc":
             x, y = int(ch.get("x", -1)), int(ch.get("y", -1))
