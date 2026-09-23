@@ -298,6 +298,7 @@ class WorldManager:
     def _materialize_chunk(self, node: dict) -> None:
         """Write tiles, objects and NPCs for a freshly generated chunk to the DB."""
         data = node.get("data") or {}
+        node_id = node.get("id")
         rows = data.get("rows") or []
         cs = self.chunk_size
         ox, oy = node["x"], node["y"]
@@ -324,7 +325,9 @@ class WorldManager:
             self.store.add_npc(
                 self.world_id, ox + int(n["x"]), oy + int(n["y"]),
                 name, race=str(n.get("race", "")), role=str(n.get("role", "")),
-                personality=str(n.get("personality", "")), tick=tick,
+                personality=str(n.get("personality", "")),
+                appearance=str(_field(n, "appearance", "look", "features", default=""))[:80],
+                node_id=node_id, tick=tick,
             )
 
         # relationships declared with this chunk

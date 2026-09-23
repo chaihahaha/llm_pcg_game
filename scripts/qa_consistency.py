@@ -39,7 +39,8 @@ class Snapshot:
         store, wid = game.store, game.world_id
         self.tiles = {(t["x"], t["y"]): t for t in
                       store.list_tiles(wid, cx - radius, cy - radius, cx + radius, cy + radius)}
-        self.objects = {o["id"]: o for o in store.objects_near(wid, cx, cy, radius, limit=500)}
+        self.objects = {o["id"]: o for o in store.objects_near(wid, cx, cy, radius, limit=500,
+                                                       alive_only=False)}
         self.npcs = {n["id"]: n for n in
                      store.npcs_near(wid, cx, cy, radius, alive_only=False, limit=500)}
         self.nodes = {}
@@ -85,9 +86,18 @@ def check_identity(before: Snapshot, after: Snapshot, problems: List[str],
     gone = [oid for oid in before.objects if oid not in after.objects]
     if gone:
         names = ", ".join(f"#{i} {before.objects[i]['name']}" for i in gone[:5])
-        problems.append(f"A 区有 {len(gone)} 个物体在玩家离开期间被删除：{names}")
+        problems.append(f"A 区有 {len(gone)} 个物体行被物理删除（历史丢失）：{names}")
     else:
         notes.append(f"物体身份保持：{len(before.objects)} 个 id 全部保留")
+
+    destroyed = [oid for oid, o in before.objects.items()
+                 if o.get("alive") and oid in after.objects and not after.objects[oid].get("alive")]
+    if destroyed:
+        kept = all(after.objects[i]["desc"] for i in destroyed)
+        notes.append(f"离开期间被摧毁 {len(destroyed)} 个物体"
+                     + ("（均保留残迹文本，历史可追溯）" if kept else "（部分残迹描述为空）"))
+        if not kept:
+            problems.append("被摧毁的物体没有留下任何残迹描述")
 
     moved = []
     for oid, o in before.objects.items():
@@ -135,10 +145,12 @@ def check_lifecycle(before: Snapshot, after: Snapshot, problems: List[str], note
         b = after.npcs.get(nid)
         if not b or not b["alive"]:
             continue
-        steps_taken = max(0, (after.tick - before.tick)) // 60 + 4
+        elapsed_hours = max(0, after.tick - before.tick)
+        allowed = max(6, elapsed_hours)          # <=1 tile per elapsed hour
         dist = abs(b["x"] - a["x"]) + abs(b["y"] - a["y"])
-        if dist > steps_taken:
-            problems.append(f"NPC {b['name']} 位移 {dist} 格，超过可能的步数 {steps_taken}"
+        if dist > allowed:
+            problems.append(f"NPC {b['name']} 在 {elapsed_hours} 小时内位移 {dist} 格"
+                            f"（上限 {allowed}），疑似瞬移"
                             f"（({a['x']},{a['y']})->({b['x']},{b['y']})）")
 
 
@@ -151,7 +163,8 @@ def check_evolution(before: Snapshot, after: Snapshot, problems: List[str], note
                            and after.nodes[lod]["updated_tick"] > before.nodes[lod]["updated_tick"])
                      for lod in (1, 2, 3)}
     new_events = [e for e in after.events if e["tick"] > before.tick]
-    new_objects = [oid for oid in after.objects if oid not in before.objects]
+    new_objects = [oid for oid, o in after.objects.items()
+                       if oid not in before.objects and o.get("alive")]
 
     notes.append(f"离开期间：物体更新 {obj_changed}/{len(before.objects)}，"
                  f"NPC 更新 {npc_changed}/{len(before.npcs)}，新增物体 {len(new_objects)}，"
@@ -223,6 +236,71 @@ def check_story(game: Game, notes: List[str], problems: List[str]) -> None:
         notes.append("任务标题序列：" + " -> ".join(h["title"] for h in reversed(hist)))
 
 
+def audit_with_llm(game: Game, a_before: "Snapshot", a_after: "Snapshot",
+                   notes: List[str], problems: List[str]) -> dict:
+    """Ask the model to review the archive for contradictions the assertions miss.
+
+    Structural checks cannot tell that an NPC "forgot" a promise; only reading
+    the record can.  This is the semantic half of the QA.
+    """
+    from pcg import prompts
+
+    store, wid = game.store, game.world_id
+    parts: List[str] = []
+
+    if a_before is not None:
+        parts.append("## 离开 A 区前的物体")
+        for o in a_before.objects.values():
+            parts.append(f"- #{o['id']} {o['name']}({o['kind']}) @({o['x']},{o['y']}) "
+                         f"HP{o['hp']}：{(o['desc'] or '')[:60]}")
+    if a_after is not None:
+        parts.append("\n## 返回 A 区后的物体")
+        for o in a_after.objects.values():
+            parts.append(f"- #{o['id']} {o['name']}({o['kind']}) @({o['x']},{o['y']}) "
+                         f"HP{o['hp']} tick{o['updated_tick']}：{(o['desc'] or '')[:60]}")
+    parts.append("\n## A 区/世界事件流水（按时间）")
+    for e in sorted(store.recent_events(wid, limit=30), key=lambda x: x["tick"]):
+        lod = {0: "世界", 1: "区域", 2: "子区域", 3: "地块"}.get(e["lod"], "?")
+        parts.append(f"- 第{e['tick'] // 24 + 1}天[{lod}] {e['summary'][:80]}")
+    parts.append("\n## NPC 长期记忆")
+    for npc in store.npcs_near(wid, *A_START, 60, limit=12):
+        mem = store.npc_memories(npc["id"], limit=8)
+        if mem:
+            parts.append(f"- {npc['name']}（{npc['role']}，{npc['mood']}）")
+            parts.extend(f"    · [{m['kind']}] {m['text'][:70]}" for m in mem)
+    parts.append("\n## 关系图")
+    for r in store.list_relations(wid, limit=30):
+        parts.append(f"- {r['a_name']} --{r['kind']}({r['value']})--> {r['b_name']}"
+                     f"：{(r['note'] or '')[:40]}")
+    parts.append("\n## 任务线（旧 -> 新）")
+    for s in reversed(store.story_history(wid, limit=12)):
+        parts.append(f"- [{s['state']}] {s['title']}：{(s['summary'] or '')[:70]}")
+    parts.append("\n## 对话摘录（部分）")
+    for d in store.conn.execute(
+            "SELECT npc_id, role, tick, content FROM dialogue WHERE world_id=? ORDER BY id LIMIT 30",
+            (wid,)):
+        parts.append(f"- 第{d['tick'] // 24 + 1}天 {d['role']}: {d['content'][:70]}")
+
+    material = "\n".join(parts)
+    msgs = prompts.build(game.wm.world_bible(), prompts.audit_task(1234, material))
+    data = game.llm.json(msgs, task="audit", max_tokens=1200, temperature=0.2, default={})
+    verdict = str(data.get("verdict") or "")
+    findings = [c for c in (data.get("contradictions") or []) if isinstance(c, dict)]
+    say(f"\n## LLM 一致性审计：{verdict}")
+    for c in findings[:10]:
+        sev = c.get("severity", "?")
+        say(f"  [{c.get('category', '?')}/{sev}] {c.get('where', '')}：{c.get('issue', '')}")
+        say(f"        依据：{c.get('evidence', '')}")
+    if not findings:
+        say("  （未发现矛盾）")
+    high = [c for c in findings if c.get("severity") == "high"]
+    if high:
+        problems.append(f"LLM 审计发现 {len(high)} 处高危矛盾")
+    elif findings:
+        notes.append(f"LLM 审计发现 {len(findings)} 处低/中危问题（见报告）")
+    return {"verdict": verdict, "contradictions": findings}
+
+
 def run(args) -> int:
     global _STATUS_PATH
     _STATUS_PATH = args.status
@@ -284,10 +362,14 @@ def run(args) -> int:
         check_memory(game, notes, problems)
         check_story(game, notes, problems)
 
+        audit_result = None
+        if args.audit:
+            audit_result = audit_with_llm(game, a_before, a_after, notes, problems)
         if game.llm.degraded and not args.mock:
             problems.append("LLM 中途降级为 Mock 后端：后半段内容为虚构，结论不可用")
         if args.report:
-            _write_report(args.report, game, world, a_before, far_snap, a_after, notes, problems)
+            _write_report(args.report, game, world, a_before, far_snap, a_after, notes, problems,
+                          audit_result)
     finally:
         stats = game.llm.stats
         game.close()
@@ -315,7 +397,8 @@ def _quiet(game: Game, line: str) -> str:
 
 def _write_report(path: str, game: Game, world: dict, a_before: Snapshot,
                   far_snap: Snapshot, a_after: Snapshot,
-                  notes: List[str], problems: List[str]) -> None:
+                  notes: List[str], problems: List[str],
+                  audit: dict | None = None) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     store, wid = game.store, game.world_id
     lines: List[str] = []
@@ -328,6 +411,13 @@ def _write_report(path: str, game: Game, world: dict, a_before: Snapshot,
     w("\n".join(f"- {n}" for n in notes))
     w("\n## 问题")
     w("\n".join(f"- ☠ {p}" for p in problems) if problems else "- 无")
+
+    if audit:
+        w("\n## LLM 一致性审计")
+        w(f"评价：{audit.get('verdict', '')}")
+        for c in audit.get("contradictions") or []:
+            w(f"- [{c.get('category', '?')}/{c.get('severity', '?')}] {c.get('where', '')}："
+              f"{c.get('issue', '')}  依据：{c.get('evidence', '')}")
 
     w("\n## A 区物体：离开前 -> 返回后")
     w("| id | 名称 | 类别 | 位置 | 描述 | HP |")
@@ -390,9 +480,49 @@ def main() -> int:
     ap.add_argument("--radius", type=int, default=24)
     ap.add_argument("--report", default="")
     ap.add_argument("--status", default=os.path.join(ROOT, "logs", "qa_status.txt"))
+    ap.add_argument("--audit", action="store_true", help="跑完后让 LLM 审计档案中的矛盾")
+    ap.add_argument("--audit-only", action="store_true",
+                    help="不跑场景，只对已有 --db 做一次 LLM 审计")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+    if args.audit_only:
+        args.audit = True
+        return audit_only(args)
     return run(args)
+
+
+def audit_only(args) -> int:
+    cfg = load_config(None, {
+        "llm": {"mock": bool(args.mock), "cache_path": args.cache},
+        "game": {"db_path": args.db},
+    })
+    game = Game(cfg, verbose=args.verbose)
+    problems: List[str] = []
+    notes: List[str] = []
+    try:
+        if not args.mock and not game.llm.ping():
+            say("✗ 无法连接本地大模型。")
+            return 2
+        world = game.load_world()
+        say(f"审计世界：{world['name']}（{world['era']}）  后端={game.llm.backend_name}")
+        result = audit_with_llm(game, None, None, notes, problems)
+        if args.report:
+            os.makedirs(os.path.dirname(os.path.abspath(args.report)) or ".", exist_ok=True)
+            lines = [f"# LLM 一致性审计：{world['name']}（{world['era']}）\n",
+                     f"- 后端：{game.llm.backend_name}",
+                     f"- LLM 统计：`{game.llm.stats}`\n",
+                     f"## 评价\n{result.get('verdict', '')}\n", "## 发现"]
+            for c in result.get("contradictions") or []:
+                lines.append(f"- [{c.get('category', '?')}/{c.get('severity', '?')}] "
+                             f"{c.get('where', '')}：{c.get('issue', '')}  依据：{c.get('evidence', '')}")
+            if not result.get("contradictions"):
+                lines.append("- 未发现矛盾")
+            with open(args.report, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+            say(f"报告已写入 {args.report}")
+    finally:
+        game.close()
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":

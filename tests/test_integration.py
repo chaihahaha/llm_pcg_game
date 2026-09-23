@@ -198,6 +198,15 @@ class TestContinuity(unittest.TestCase):
                            "a scope far from the player was never evolved (world froze)")
         self.assertGreater(self.store.get_node_by_id(near["id"])["updated_tick"], 0)
 
+    def test_distant_chunks_tick_more_coarsely(self):
+        """Otherwise an explored world would queue a full sweep every 6 hours."""
+        base = self.engine.schedule[LOD_CHUNK]
+        self.assertEqual(self.engine._effective_period(LOD_CHUNK, 0), base)
+        self.assertGreater(self.engine._effective_period(LOD_CHUNK, 96), base)
+        # non-chunk levels keep their period regardless of distance
+        self.assertEqual(self.engine._effective_period(LOD_ZONE, 1000),
+                         self.engine.schedule[LOD_ZONE])
+
     def test_catchup_is_summarised_not_stepped(self):
         self.wm.ensure_node(LOD_CHUNK, 0, 0)
         self.engine.advance(1, 8, 8)
@@ -251,6 +260,56 @@ class TestContinuity(unittest.TestCase):
         # a second conversation must see the first one's memory in its prompt
         text = narrator.npc_memory_digest(npc)
         self.assertIn("守望塔", text)
+
+    def test_one_evolution_step_cannot_teleport_an_npc(self):
+        from pcg.terrain import is_solid
+
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        node = self.store.get_node(self.wm.world_id, LOD_CHUNK, 0, 0)
+        npc = self.store.npcs_near(self.wm.world_id, 8, 8, 16, limit=1)[0]
+        self.store.update_npc(npc["id"], x=8, y=8)
+        start = (8, 8)
+
+        self.engine._apply(3, node, 5, {"changes": [{"type": "npc", "name": npc["name"],
+                                                     "move": [20, 20]}]})
+        cur = self.store.get_npc(npc["id"])
+        self.assertEqual((cur["x"], cur["y"]), start, "an oversized jump must be rejected")
+
+        # a single step in a genuinely walkable direction must still work
+        step = next((d for d in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                     if not is_solid((self.store.get_tile(self.wm.world_id,
+                                                          8 + d[0], 8 + d[1]) or {"terrain": "water"})["terrain"])
+                     and not self.store.objects_at(self.wm.world_id, 8 + d[0], 8 + d[1])), None)
+        if step is None:
+            self.skipTest("surrounded by impassable terrain")
+        self.engine._apply(3, node, 6, {"changes": [{"type": "npc", "name": npc["name"],
+                                                     "move": list(step)}]})
+        cur = self.store.get_npc(npc["id"])
+        self.assertEqual(abs(cur["x"] - start[0]) + abs(cur["y"] - start[1]), 1,
+                         "a normal step must still apply")
+
+    def test_npc_status_is_tracked_and_feeds_dialogue(self):
+        from pcg.entities import Player
+        from pcg.narrative import Narrator
+
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        node = self.store.get_node(self.wm.world_id, LOD_CHUNK, 0, 0)
+        npc = self.store.npcs_near(self.wm.world_id, 8, 8, 16, limit=1)[0]
+        self.engine._apply(3, node, 7, {"changes": [
+            {"type": "npc", "name": npc["name"], "status": "重伤昏迷", "note": "被落石砸中"},
+        ]})
+        self.assertEqual(self.store.get_npc(npc["id"])["status"], "重伤昏迷")
+
+        # the next evolution prompt must be able to see that condition
+        digest = self.engine._npc_line(self.store.get_npc(npc["id"]))
+        self.assertIn("重伤昏迷", digest)
+
+        # and dialogue must be told about it
+        self.store.create_player(self.wm.world_id, "旅人", 8, 8, 30, 5, 2)
+        player = Player(self.store, self.wm.world_id)
+        narrator = Narrator(self.store, self.llm, self.cfg, self.wm)
+        narrator.talk(player, self.store.get_npc(npc["id"]), "你还好吗？")
+        self.assertTrue(narrator.npc_history_digest(self.store.get_npc(npc["id"])) is not None)
 
     def test_nation_relations_are_seeded(self):
         rels = self.store.list_relations(self.wm.world_id, kind="nation")

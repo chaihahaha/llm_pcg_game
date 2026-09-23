@@ -290,10 +290,12 @@ class MockBackend:
             "npcs": [
                 {"x": 6, "y": 6, "name": pick(_MOCK_GIVEN, seed, "cn") + pick(_MOCK_SURNAME, seed, "cs"),
                  "race": pick(_MOCK_RACES, seed, "cr"), "role": pick(_MOCK_ROLES, seed, "crole"),
-                 "personality": "多疑，但提到古代遗迹时话会变多。"},
+                 "personality": "多疑，但提到古代遗迹时话会变多。",
+                 "appearance": "左手戴着褪色的铜护腕，右眼有一道白色旧疤。"},
                 {"x": 9, "y": 11, "name": pick(_MOCK_GIVEN, seed, "cn2") + pick(_MOCK_SURNAME, seed, "cs2"),
                  "race": pick(_MOCK_RACES, seed, "cr2"), "role": pick(_MOCK_ROLES, seed, "crole2"),
-                 "personality": "寡言，习惯先观察再开口。"},
+                 "personality": "寡言，习惯先观察再开口。",
+                 "appearance": "总披着沾满灰的羊毛斗篷，右脚微跛。"},
             ],
             "relations": [
                 {"a": pick(_MOCK_GIVEN, seed, "cn") + pick(_MOCK_SURNAME, seed, "cs"),
@@ -328,6 +330,8 @@ class MockBackend:
         if names:
             changes.append({"type": "memory", "name": names[0], "kind": "goal",
                             "text": "我决定盯住那条新出现的兽径。"})
+            changes.append({"type": "npc", "name": names[0], "mood": "警觉",
+                            "status": "在兽径旁蹲守", "note": "发现新鲜蹄印后决定留下观察。"})
         if len(names) >= 2:
             changes.append({"type": "relation", "a_kind": "npc", "a_name": names[0],
                             "b_kind": "npc", "b_name": names[1], "kind": "敌对",

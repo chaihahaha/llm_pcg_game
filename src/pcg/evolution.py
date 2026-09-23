@@ -56,6 +56,7 @@ class EvolutionEngine:
         self.max_prompt_tokens = int(cfg_get(cfg, "context.max_prompt_tokens", 24000))
         self.catchup_steps = int(cfg_get(cfg, "evolution.catchup_steps", 3))
         self.max_catchup_calls = int(cfg_get(cfg, "evolution.max_catchup_calls", 8))
+        self.distance_scaling = bool(cfg_get(cfg, "evolution.distance_scaling", True))
 
     # ------------------------------------------------------------------ tick
     def tick(self) -> int:
@@ -120,7 +121,8 @@ class EvolutionEngine:
         chunks: List[Tuple[int, dict, int, int]] = []
         for node in sorted(self.store.nodes_of_lod(self.world_id, LOD_CHUNK), key=dist):
             elapsed = tick - int(node.get("updated_tick") or 0)
-            steps = elapsed // max(1, self.schedule[LOD_CHUNK])
+            period = self._effective_period(LOD_CHUNK, dist(node))
+            steps = elapsed // max(1, period)
             if steps >= 1:
                 chunks.append((LOD_CHUNK, node, steps, elapsed))
 
@@ -151,7 +153,7 @@ class EvolutionEngine:
         text = self._fit_budget(text)
         msgs = prompts.build(self.wm.world_bible(), text)
         data = self.llm.json(msgs, task=task, default={})
-        return self._apply(lod, node, tick, data)
+        return self._apply(lod, node, tick, data, elapsed_hours=elapsed_hours)
 
     def _scope_desc(self, lod: int, node: dict) -> str:
         data = node.get("data") or {}
@@ -224,11 +226,7 @@ class EvolutionEngine:
                 parts.append("物体：" + "；".join(
                     f"#{o['id']}[{o['x']},{o['y']}]{o['name']}({o['kind']})" for o in picks))
             if npcs:
-                parts.append("NPC：" + "；".join(
-                    f"[{n['name']}@{n['x']},{n['y']},{n['role']},HP{n['hp']},{n['mood']}]"
-                    + (f"记得：{m['text'][:30]}" if (m := (self.store.npc_memories(n["id"], 1) or [None])[0])
-                       else "")
-                    for n in npcs))
+                parts.append("NPC：" + "；".join(self._npc_line(n) for n in npcs))
             return "\n".join(parts)
         if lod == LOD_ZONE:
             subs = self.store.nodes_in_rect(self.world_id, LOD_CHUNK, node["x"], node["y"],
@@ -243,7 +241,8 @@ class EvolutionEngine:
         return prompts.digest_nations(self.store.list_nations(self.world_id))
 
     # ------------------------------------------------------------------ apply
-    def _apply(self, lod: int, node: dict, tick: int, data: Dict[str, Any]) -> List[dict]:
+    def _apply(self, lod: int, node: dict, tick: int, data: Dict[str, Any],
+               elapsed_hours: int = 0) -> List[dict]:
         if not isinstance(data, dict):
             data = {}
         created: List[dict] = []
@@ -255,11 +254,13 @@ class EvolutionEngine:
             node_data["weather"] = weather[:20]
         changes = data.get("changes") if isinstance(data.get("changes"), list) else []
 
+        # one evolution step is a step: an NPC may not cross the map in it
+        move_budget: Dict[int, int] = {}
         for ch in changes[:6]:
             if not isinstance(ch, dict):
                 continue
             try:
-                self._apply_change(lod, node, tick, ch)
+                self._apply_change(lod, node, tick, ch, move_budget)
             except Exception as exc:  # noqa: BLE001
                 if self.logger:
                     self.logger.debug("skip change %s: %s", ch, exc)
@@ -270,23 +271,32 @@ class EvolutionEngine:
 
         center_x = node["x"] + (node["w"] // 2)
         center_y = node["y"] + (node["h"] // 2)
-        for ev in (data.get("events") or [])[:4]:
-            if not isinstance(ev, dict):
-                continue
-            text = str(ev.get("text") or "").strip()
-            if not text:
-                continue
+        events = [ev for ev in (data.get("events") or [])[:4] if isinstance(ev, dict)]
+        events = [ev for ev in events if str(ev.get("text") or "").strip()]
+        for i, ev in enumerate(events):
+            # A catch-up covers many hours: spread its events across the window
+            # instead of stamping them all at the same instant, otherwise the
+            # timeline reads as if everything happened simultaneously.
+            if elapsed_hours > 0 and len(events) > 1:
+                ev_tick = tick - elapsed_hours + int((i + 1) * elapsed_hours / (len(events) + 1))
+            else:
+                ev_tick = tick
+            text = str(ev["text"]).strip()
             kind = str(ev.get("kind") or "event")[:20]
-            eid = self.store.add_event(self.world_id, tick, lod, node["id"],
+            eid = self.store.add_event(self.world_id, ev_tick, lod, node["id"],
                                        center_x, center_y, kind, text[:200])
-            created.append({"id": eid, "tick": tick, "lod": lod, "kind": kind, "summary": text,
+            created.append({"id": eid, "tick": ev_tick, "lod": lod, "kind": kind, "summary": text,
                             "x": center_x, "y": center_y, "node_id": node["id"]})
 
         self.store.update_node(node["id"], summary=summary or None, data=node_data, tick=tick)
         self.store.commit()
         return created
 
-    def _apply_change(self, lod: int, node: dict, tick: int, ch: Dict[str, Any]) -> None:
+    MAX_MOVE_PER_CHANGE = 2
+    MAX_MOVE_PER_STEP = 3
+
+    def _apply_change(self, lod: int, node: dict, tick: int, ch: Dict[str, Any],
+                      move_budget: Dict[int, int] | None = None) -> None:
         kind = str(ch.get("type") or "").strip()
 
         if kind == "new_object":
@@ -326,13 +336,24 @@ class EvolutionEngine:
                     patch["alive"] = 0
             mv = ch.get("move")
             if isinstance(mv, (list, tuple)) and len(mv) == 2:
-                nx, ny = int(npc["x"]) + int(mv[0]), int(npc["y"]) + int(mv[1])
-                if self._in_scope(node, nx, ny):
-                    tile = self.store.get_tile(self.world_id, nx, ny)
-                    if tile is None or tile["terrain"] not in ("water", "mountain", "lava"):
-                        patch["x"], patch["y"] = nx, ny
+                dx, dy = int(mv[0]), int(mv[1])
+                spent = (move_budget or {}).get(npc["id"], 0)
+                if (abs(dx) <= self.MAX_MOVE_PER_CHANGE and abs(dy) <= self.MAX_MOVE_PER_CHANGE
+                        and spent + abs(dx) + abs(dy) <= self.MAX_MOVE_PER_STEP):
+                    nx, ny = int(npc["x"]) + dx, int(npc["y"]) + dy
+                    if self._in_scope(node, nx, ny):
+                        tile = self.store.get_tile(self.world_id, nx, ny)
+                        if tile is None or tile["terrain"] not in ("water", "mountain", "lava"):
+                            patch["x"], patch["y"] = nx, ny
+                            if move_budget is not None:
+                                move_budget[npc["id"]] = spent + abs(dx) + abs(dy)
+                elif self.logger:
+                    self.logger.info("rejected reposition of %s by (%d,%d) — too far for one step",
+                                     npc["name"], dx, dy)
             if ch.get("mood"):
                 patch["mood"] = str(ch["mood"])[:16]
+            if ch.get("status"):
+                patch["status"] = str(ch["status"])[:24]
             note = str(ch.get("note", ""))[:80]
             if note:
                 state = dict(npc.get("state") or {})
@@ -416,6 +437,45 @@ class EvolutionEngine:
             patch = {k: str(v)[:120] for k, v in ch["set"].items() if k in allowed}
             if patch:
                 self.store.upsert_nation(self.world_id, name, updated_tick=tick, **patch)
+
+    def _effective_period(self, lod: int, distance: int) -> int:
+        """Far-away scopes are ticked more coarsely than the one underfoot.
+
+        Without this, a player who has explored 60 chunks would make all of them
+        due every 6 hours, and the per-advance budget would never catch up.
+        Ticking a chunk 30 tiles away once a day is plenty; the one you are
+        standing in still gets its 6-hour granularity.
+        """
+        base = self.schedule[lod]
+        if lod != LOD_CHUNK or not self.distance_scaling:
+            return base
+        bucket = min(8, max(1, distance // max(1, self.wm.chunk_size * 3)))
+        return base * bucket
+
+    def _npc_line(self, n: dict) -> str:
+        """One NPC rendered for a prompt: state now + what it just did.
+
+        Without the per-NPC history the model re-runs the same beat ("flees into
+        the shaft") on every catch-up step, because the shared event window has
+        long since scrolled past the previous occurrence.
+        """
+        bits = [f"[{n['name']}@{n['x']},{n['y']},{n['role']},HP{n['hp']}/{n['hp_max']},"
+                f"心情{n['mood']}"]
+        if n.get("status"):
+            bits.append(f"状态{n['status']}")
+        if n.get("appearance"):
+            bits.append(f"外貌{n['appearance'][:24]}")
+        line = "".join(bits) + "]"
+        last = (n.get("state") or {}).get("last")
+        if last:
+            line += f"(上一步：{str(last)[:40]})"
+        mem = self.store.npc_memories(n["id"], 1)
+        if mem:
+            line += f"(记得：{mem[0]['text'][:30]})"
+        prior = self.store.events_mentioning(self.world_id, n["name"], limit=2)
+        if prior:
+            line += "。近事：" + "；".join(e["summary"][:44] for e in prior)
+        return line
 
     def _entity_exists(self, kind: str, name: str) -> bool:
         if not name:

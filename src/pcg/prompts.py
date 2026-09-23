@@ -118,7 +118,8 @@ def chunk_task(seed: int, zone: Dict[str, Any], cx: int, cy: int, size: int) -> 
         '"patches":[{"terrain":"地形名","x":0,"y":0,"w":8,"h":16},'
         '{"terrain":"地形名","x":8,"y":0,"w":8,"h":9}],'
         '"features":[{"x":0,"y":0,"kind":"rock|ruin|plant|arcane|water|building","name":"名称","desc":"描述(15-35字)"}],'
-        '"npcs":[{"x":0,"y":0,"name":"人名","race":"民族","role":"身份","personality":"性格"}],'
+        '"npcs":[{"x":0,"y":0,"name":"人名","race":"民族","role":"身份","personality":"性格",'
+        '"appearance":"稳定可复用的外貌特征(15-30字)"}],'
         '"relations":[{"a":"人名","b":"另一个人名或国名","kind":"盟友|敌对|亲属|债主|师徒|雇主|同乡",'
         '"value":-5到5,"note":"关系由来(10-25字)"}]}\n'
         f"patches 为 3-6 个矩形地块，x/y 是左上角坐标(0-{maxc})，w/h 至少 2，"
@@ -182,7 +183,8 @@ def evolve_task(lod_name: str, seed: int, scope_desc: str, local_digest: str,
         '"events":[{"kind":"politics|economy|magic|weather|wildlife|conflict|discovery","text":"事件描述(20-50字)"}],'
         '"changes":[{"type":"new_object","x":整数,"y":整数,"kind":"物体类型","name":"名称","desc":"描述"},'
         '{"type":"new_npc","x":整数,"y":整数,"name":"人名","race":"民族","role":"身份","personality":"性格"},'
-        '{"type":"npc","name":"已有NPC名","hp_delta":整数,"move":[dx,dy],"mood":"情绪","note":"发生了什么"},'
+        '{"type":"npc","name":"已有NPC名","hp_delta":整数,"move":[dx,dy],"mood":"情绪",'
+        '"status":"当前处境（如 昏迷/重伤/潜逃中/被俘/正常，无变化则省略）","note":"发生了什么"},'
         '{"type":"object","id":整数,"destroyed":true},'
         '{"type":"tile","x":整数,"y":整数,"terrain":"地形名","desc":"变化描述"},'
         '{"type":"relation","a_kind":"nation|npc","a_name":"名字","b_kind":"nation|npc","b_name":"名字",'
@@ -198,12 +200,17 @@ def evolve_task(lod_name: str, seed: int, scope_desc: str, local_digest: str,
 
 def dialogue_task(seed: int, npc: Dict[str, Any], world_brief: str, place: str,
                   local_events: str, history: str, player_line: str, quest: str,
-                  memories: str = "", relations: str = "") -> str:
+                  memories: str = "", relations: str = "", npc_history: str = "") -> str:
     return (
         f"[[TASK:dialogue]][[NPC:{npc.get('name','')}]][[SEED:{seed}]]\n"
         f"你扮演 NPC「{npc.get('name','')}」，{npc.get('race','')}，{npc.get('role','')}，"
-        f"性格：{npc.get('personality','')}，当前情绪：{npc.get('mood','平静')}。\n"
-        f"所处位置：{place}。世界背景：{world_brief}\n"
+        f"性格：{npc.get('personality','')}，当前情绪：{npc.get('mood','平静')}"
+        + (f"，当前处境：{npc.get('status')}" if npc.get("status") else "")
+        + "。\n"
+        + (f"你的固定外貌（不得改口、不得添加未记录的身体特征）：{npc.get('appearance')}\n"
+           if npc.get("appearance") else "")
+        + (f"你最近亲历过的事（与这些保持一致）：{npc_history}\n" if npc_history else "")
+        + f"所处位置：{place}。世界背景：{world_brief}\n"
         f"当地近期传闻：{local_events or '无'}\n"
         f"你记得的事（这是你的长期记忆，必须与之一致，不得遗忘或否认）：{memories or '（暂无）'}\n"
         f"你的人际关系（必须保持一致，可流露态度）：{relations or '（暂无）'}\n"
@@ -211,7 +218,8 @@ def dialogue_task(seed: int, npc: Dict[str, Any], world_brief: str, place: str,
         f"玩家说：{player_line}\n"
         f"玩家当前任务：{quest or '暂无'}\n"
         "用 NPC 的口吻回答（1-3 句，符合身份、性格与当地见闻，可以夹带线索或提出请求）。"
-        "绝不能与上述记忆或先前对话矛盾；若玩家问到你不知道的事，就承认不知道。输出 JSON："
+        "绝不能与上述记忆、亲历之事或先前对话矛盾；不要编造未记录的外貌特征，"
+        "不要给出与记录不符的人数/伤亡数字；若玩家问到你不知道的事，就承认不知道。输出 JSON："
         '{"reply":"NPC说的话","mood":"回答后NPC的情绪","action":"none|quest|trade|attack|info",'
         '"action_data":{"quest_title":"当 action=quest 时给出","quest_summary":"任务概要"},'
         '"memories":[{"kind":"fact|promise|grudge|debt|goal","about":"涉及的人或地","text":"本次对话后你会记住的新事"}],'
@@ -245,6 +253,26 @@ def story_task(seed: int, player_brief: str, world_brief: str, recent: str,
         "如果上一条线索未完成，应当推进它而不是凭空另起炉灶。输出 JSON："
         '{"title":"任务名(4-10字)","summary":"任务背景(40-80字)","objective":"玩家要做什么(20-40字)",'
         '"stakes":"失败后果(15-30字)","hint":"去哪找线索(15-30字)"}'
+    )
+
+
+def audit_task(seed: int, material: str) -> str:
+    return (
+        f"[[TASK:audit]][[SEED:{seed}]]\n"
+        "你是这个开放世界的一致性审计员。下面是同一个世界里的一份档案，包含："
+        "玩家离开某地前后的物体与人物状态、按时间排列的事件流水、NPC 的长期记忆、"
+        "人物之间的关系边、以及历次任务线。\n"
+        "请找出其中**真正的问题**，只报告有证据的矛盾：\n"
+        "A. 逻辑矛盾（同一实体前后状态冲突、已经死亡/被毁的东西又出现、位置瞬移、"
+        "数值越界、时间倒流）\n"
+        "B. 失忆（NPC 或任务线遗忘了先前已确立的事实、承诺、恩怨、人物）\n"
+        "C. 与历史冲突（新描述与既有事件/设定/身份不一致）\n"
+        "D. 世界停滞（某地在很长时间里毫无变化，却又与上层大事并存）\n"
+        "没有把握的就不要报。输出 JSON："
+        '{"contradictions":[{"category":"A|B|C|D","where":"涉及对象/地点","issue":"问题(30-60字)",'
+        '"evidence":"档案中的依据(30-60字)","severity":"high|medium|low"}],'
+        '"verdict":"整体一致性评价(40-80字)"}\n'
+        "档案：\n" + material
     )
 
 

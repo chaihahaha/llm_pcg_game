@@ -98,7 +98,9 @@ CREATE TABLE IF NOT EXISTS npcs (
     role TEXT DEFAULT '',
     faction TEXT DEFAULT '',
     personality TEXT DEFAULT '',
+    appearance TEXT DEFAULT '',
     mood TEXT DEFAULT '平静',
+    status TEXT DEFAULT '',
     hp INTEGER DEFAULT 10,
     hp_max INTEGER DEFAULT 10,
     atk INTEGER DEFAULT 3,
@@ -300,7 +302,12 @@ class Store:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(objects)")}
         if "alive" not in cols:
             self.conn.execute("ALTER TABLE objects ADD COLUMN alive INTEGER DEFAULT 1")
-            self.conn.commit()
+        npc_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(npcs)")}
+        if "appearance" not in npc_cols:
+            self.conn.execute("ALTER TABLE npcs ADD COLUMN appearance TEXT DEFAULT ''")
+        if "status" not in npc_cols:
+            self.conn.execute("ALTER TABLE npcs ADD COLUMN status TEXT DEFAULT ''")
+        self.conn.commit()
 
     def close(self) -> None:
         try:
@@ -581,15 +588,16 @@ class Store:
 
     # ------------------------------------------------------------------- npcs
     def add_npc(self, world_id: int, x: int, y: int, name: str, race: str = "", role: str = "",
-                faction: str = "", personality: str = "", npc_id: Optional[int] = None,
+                faction: str = "", personality: str = "", appearance: str = "",
+                node_id: Optional[int] = None,
                 hp: int = 10, atk: int = 3, defense: int = 1, hostile: int = 0,
                 state: dict | None = None, tick: int = 0) -> int:
         cur = self.conn.execute(
-            "INSERT INTO npcs(world_id,node_id,x,y,name,race,role,faction,personality,mood,hp,hp_max,atk,def,"
-            "hostile,alive,state_json,created_tick,updated_tick)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
-            (world_id, npc_id, x, y, name, race, role, faction, personality, "平静",
-             hp, hp, atk, defense, hostile, _dumps(state or {}), tick, tick),
+            "INSERT INTO npcs(world_id,node_id,x,y,name,race,role,faction,personality,appearance,"
+            "mood,status,hp,hp_max,atk,def,hostile,alive,state_json,created_tick,updated_tick)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
+            (world_id, node_id, x, y, name, race, role, faction, personality, appearance[:80],
+             "平静", "", hp, hp, atk, defense, hostile, _dumps(state or {}), tick, tick),
         )
         self.commit()
         return int(cur.lastrowid)
@@ -621,9 +629,9 @@ class Store:
         return self._npc(row) if row else None
 
     def update_npc(self, npc_id: int, **fields) -> None:
-        allowed = {"x", "y", "name", "race", "role", "faction", "personality", "mood",
-                   "hp", "hp_max", "atk", "def", "hostile", "alive", "updated_tick",
-                   "node_id"}
+        allowed = {"x", "y", "name", "race", "role", "faction", "personality", "appearance",
+                   "mood", "status", "hp", "hp_max", "atk", "def", "hostile", "alive",
+                   "updated_tick", "node_id"}
         sets, vals = [], []
         for k, v in fields.items():
             if k in allowed:
@@ -828,6 +836,20 @@ class Store:
             d["data"] = _loads(d.pop("data_json", "{}"), {})
             out.append(d)
         return out
+
+    def events_mentioning(self, world_id: int, name: str, limit: int = 6) -> List[dict]:
+        if not name:
+            return []
+        rows = self.conn.execute(
+            "SELECT * FROM events WHERE world_id=? AND summary LIKE ? ORDER BY id DESC LIMIT ?",
+            (world_id, f"%{name}%", limit),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["data"] = _loads(d.pop("data_json", "{}"), {})
+            out.append(d)
+        return list(reversed(out))
 
     def events_for_player(self, world_id: int, x: int, y: int, r: int, limit: int = 30) -> List[dict]:
         rows = self.conn.execute(

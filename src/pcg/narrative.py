@@ -111,6 +111,15 @@ class Narrator:
             lines.append(f"- [{m['kind']}]{about} {m['text']}")
         return "\n".join(lines)
 
+    def npc_history_digest(self, npc: dict, limit: int = 3) -> str:
+        """What this NPC actually lived through, straight from the event log.
+
+        Keeps dialogue tied to recorded facts, so the NPC cannot describe
+        events that never happened or contradict the archive.
+        """
+        rows = self.store.events_mentioning(self.world_id, npc["name"], limit=limit)
+        return "；".join(f"[第{e['tick'] // 24 + 1}天]{e['summary'][:60]}" for e in rows)
+
     def npc_relation_digest(self, npc: dict, limit: int = 6) -> str:
         rels = self.store.relations_for(self.world_id, "npc", npc["name"], limit=limit)
         if not rels:
@@ -130,7 +139,8 @@ class Narrator:
             history, line, (f"{quest['title']}：{str(quest.get('data',{}).get('objective',''))}"
                             if quest else ""),
             memories=self.npc_memory_digest(npc),
-            relations=self.npc_relation_digest(npc))
+            relations=self.npc_relation_digest(npc),
+            npc_history=self.npc_history_digest(npc))
         msgs = prompts.build(self.wm.world_bible(), text)
         data = self.llm.json(msgs, task="dialogue", default={})
         reply = str(data.get("reply") or "……").strip()
