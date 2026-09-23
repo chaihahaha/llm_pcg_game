@@ -575,9 +575,14 @@ class Store:
         state["destroyed_tick"] = tick
         if obj.get("desc"):
             state["last_desc"] = obj["desc"]
+        # Rename and retype so no reader (human or model) can mistake the
+        # remnant for the intact thing: the record must not read
+        # "the mech was destroyed" next to an object still called "the mech".
+        name = obj["name"] if obj["name"].endswith("的残迹") else f"{obj['name']}的残迹"
         self.conn.execute(
-            "UPDATE objects SET alive=0, hp=0, desc=?, state_json=?, updated_tick=? WHERE id=?",
-            (desc or f"（{obj['name']}的残迹）", _dumps(state), tick, obj_id),
+            "UPDATE objects SET alive=0, hp=0, name=?, kind='ruin', desc=?, state_json=?,"
+            " updated_tick=? WHERE id=?",
+            (name[:30], desc or f"（{obj['name']}被毁后的残迹）", _dumps(state), tick, obj_id),
         )
 
     @staticmethod

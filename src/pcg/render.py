@@ -14,6 +14,8 @@ OBJ_SYM = {
     "altar": "&", "corpse": "x", "creature": "c", "object": "o", "feature": "o",
 }
 
+RUBBLE_SYM = "x"  # destroyed objects stay on the map as ruins
+
 
 def _npc_char(npc: dict) -> str:
     name = str(npc.get("name") or "?")
@@ -30,9 +32,11 @@ def render_view(wm, cx: int, cy: int, size: int = 16, player=None) -> str:
     for (tx, ty), tile in tiles.items():
         grid[(tx, ty)] = symbol_of(tile["terrain"])
 
-    objs = store.objects_near(world_id, cx, cy, size // 2 + 1, limit=200)
+    objs = store.objects_near(world_id, cx, cy, size // 2 + 1, limit=200, alive_only=False)
     for o in objs:
-        grid[(o["x"], o["y"])] = OBJ_SYM.get(o.get("kind", "object"), "o")
+        # ruins stay visible: destruction is a change of state, not erasure
+        grid[(o["x"], o["y"])] = (OBJ_SYM.get(o.get("kind", "object"), "o")
+                                  if o.get("alive", 1) else RUBBLE_SYM)
 
     npcs = store.npcs_near(world_id, cx, cy, size // 2 + 1, limit=100)
     for n in npcs:
@@ -85,6 +89,12 @@ def render_tile_info(wm, x: int, y: int, describe: bool = True) -> str:
         for o in objects:
             hp = f"，耐久 {o['hp']}/{o['hp_max']}" if o.get("hp_max") else ""
             lines.append(f"  · {o['name']}（{o['kind']}{hp}）：{o['desc'] or '没有更多说明。'}")
+    debris = [o for o in store.objects_at(world_id, x, y, alive_only=False) if not o.get("alive", 1)]
+    if debris:
+        lines.append("残迹：")
+        for o in debris:
+            when = (o.get("state") or {}).get("destroyed_tick")
+            lines.append(f"  · {o['name']}（已毁于第{int(when)//24+1}天）：{o['desc']}")
 
     npcs = store.npcs_at(world_id, x, y)
     if npcs:

@@ -349,6 +349,26 @@ class TestContinuity(unittest.TestCase):
         edges = [r for r in self.store.list_relations(self.wm.world_id) if r["a_kind"] == "npc"]
         self.assertTrue(edges, "the NPC relation graph must not be empty")
 
+    def test_destroyed_object_reads_unambiguously_and_still_renders(self):
+        from pcg import render
+
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        oid = self.store.add_object(self.wm.world_id, 5, 5, "rock", "巨岩", "一块巨岩。")
+        self.store.destroy_object(oid, tick=48)
+        row = self.store.get_object(oid)
+        self.assertIn("残迹", row["name"], "a ruin must not keep the intact thing's name")
+        self.assertEqual(row["kind"], "ruin")
+
+        # ruins stay visible on the 16x16 view (as rubble), and are walkable
+        self.store.create_player(self.wm.world_id, "旅人", 5, 6, 30, 5, 2)
+        view = render.render_view(self.wm, 5, 5, 16)
+        self.assertIn(render.RUBBLE_SYM, view)
+        self.assertEqual(self.store.objects_at(self.wm.world_id, 5, 5), [],
+                         "a ruin must not block the tile")
+
+        info = render.render_tile_info(self.wm, 5, 5, describe=False)
+        self.assertIn("残迹", info)
+
     def test_nation_relations_are_seeded(self):
         rels = self.store.list_relations(self.wm.world_id, kind="nation")
         self.assertTrue(rels, "world genesis should produce a diplomacy graph")

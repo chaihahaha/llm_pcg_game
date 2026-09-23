@@ -111,7 +111,8 @@ def check_identity(before: Snapshot, after: Snapshot, problems: List[str],
         notes.append("物体坐标与类型稳定")
 
     renamed = [o for oid, o in before.objects.items()
-               if oid in after.objects and after.objects[oid]["name"] != o["name"] and o["name"]]
+               if oid in after.objects and after.objects[oid]["name"] != o["name"] and o["name"]
+               and after.objects[oid].get("alive", 1)]
     if renamed:
         problems.append(f"{len(renamed)} 个物体被改名（历史名不应丢失）")
 
@@ -248,6 +249,9 @@ def audit_with_llm(game: Game, a_before: "Snapshot", a_after: "Snapshot",
     store, wid = game.store, game.world_id
     parts: List[str] = []
 
+    parts.append(
+        "说明：物体被摧毁后会保留为「残迹」（软删除，用于追溯历史）；"
+        "标注 [已毁，仅存残迹] 表示它已不存在，与「被毁」事件一致，不算矛盾。")
     if a_before is not None:
         parts.append("## 离开 A 区前的物体")
         for o in a_before.objects.values():
@@ -256,7 +260,8 @@ def audit_with_llm(game: Game, a_before: "Snapshot", a_after: "Snapshot",
     if a_after is not None:
         parts.append("\n## 返回 A 区后的物体")
         for o in a_after.objects.values():
-            parts.append(f"- #{o['id']} {o['name']}({o['kind']}) @({o['x']},{o['y']}) "
+            tag = "[已毁，仅存残迹]" if not o.get("alive", 1) else "[完好]"
+            parts.append(f"- #{o['id']} {tag} {o['name']}({o['kind']}) @({o['x']},{o['y']}) "
                          f"HP{o['hp']} tick{o['updated_tick']}：{(o['desc'] or '')[:60]}")
     parts.append("\n## A 区/世界事件流水（按时间）")
     for e in sorted(store.recent_events(wid, limit=30), key=lambda x: x["tick"]):
