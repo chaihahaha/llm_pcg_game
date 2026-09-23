@@ -341,6 +341,14 @@ class TestContinuity(unittest.TestCase):
         self.assertEqual((rows[0]["x"], rows[0]["y"]), (4, 4))
         self.assertNotIn("destroyed", rows[0]["state"])
 
+    def test_social_graph_is_connected_even_without_model_relations(self):
+        """Two co-located NPCs must at least know each other."""
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        npcs = self.store.npcs_near(self.wm.world_id, 8, 8, 16, limit=10)
+        self.assertGreaterEqual(len(npcs), 2, "mock chunk should seed two NPCs")
+        edges = [r for r in self.store.list_relations(self.wm.world_id) if r["a_kind"] == "npc"]
+        self.assertTrue(edges, "the NPC relation graph must not be empty")
+
     def test_nation_relations_are_seeded(self):
         rels = self.store.list_relations(self.wm.world_id, kind="nation")
         self.assertTrue(rels, "world genesis should produce a diplomacy graph")

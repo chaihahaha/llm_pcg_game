@@ -216,7 +216,8 @@ class EvolutionEngine:
     def _neighbor_digest(self, lod: int, node: dict) -> str:
         if lod == LOD_CHUNK:
             cx, cy = node["x"], node["y"]
-            objs = self.store.objects_near(self.world_id, cx + 8, cy + 8, 12, self.max_neighbors)
+            objs = self.store.objects_near(self.world_id, cx + 8, cy + 8, 12, self.max_neighbors,
+                                           alive_only=False)
             # prefer the ones actually inside this chunk
             inside = [o for o in objs if cx <= o["x"] < cx + 16 and cy <= o["y"] < cy + 16]
             others = [o for o in objs if o not in inside]
@@ -224,8 +225,11 @@ class EvolutionEngine:
             npcs = self.store.npcs_near(self.world_id, cx + 8, cy + 8, 12, limit=6)
             parts = []
             if picks:
+                # destroyed things are shown as ruins so the model stops
+                # re-announcing their destruction or treating them as intact
                 parts.append("物体：" + "；".join(
-                    f"#{o['id']}[{o['x']},{o['y']}]{o['name']}({o['kind']})" for o in picks))
+                    f"{'[已毁]' if not o.get('alive') else ''}#{o['id']}[{o['x']},{o['y']}]"
+                    f"{o['name']}({o['kind']})" for o in picks))
             if npcs:
                 parts.append("NPC：" + "；".join(self._npc_line(n) for n in npcs))
             return "\n".join(parts)

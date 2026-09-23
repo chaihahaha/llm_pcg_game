@@ -331,6 +331,7 @@ class WorldManager:
             )
 
         # relationships declared with this chunk
+        declared = 0
         for rel in (data.get("relations") or [])[:6]:
             if not isinstance(rel, dict):
                 continue
@@ -348,6 +349,19 @@ class WorldManager:
                 value=int(rel.get("value", 0) or 0),
                 note=str(rel.get("note", ""))[:160], tick=tick,
             )
+            declared += 1
+
+        # Guarantee the social graph is connected even when the model returns no
+        # relations: co-located people at least know each other.  Neutral and
+        # factual, so it cannot fabricate drama.
+        spawned = list(name_map.values())
+        if declared == 0 and len(spawned) >= 2:
+            anchor = spawned[0]
+            for other in spawned[1:]:
+                self.store.upsert_relation(
+                    self.world_id, "npc", anchor, "npc", other, "同乡", 1,
+                    "在同一片区域活动，彼此认得。", tick=tick,
+                )
 
     def _unique_npc_name(self, name: str) -> str:
         """Names are how the player and the engine address NPCs, so they must be
