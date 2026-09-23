@@ -341,6 +341,58 @@ class TestContinuity(unittest.TestCase):
         self.assertEqual((rows[0]["x"], rows[0]["y"]), (4, 4))
         self.assertNotIn("destroyed", rows[0]["state"])
 
+    def test_npc_spawn_never_lands_in_impassable_terrain(self):
+        """A person standing inside a forest is unreachable — snap them out."""
+        from pcg.terrain import is_solid
+
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        # make a solid patch and ask for a spawn right in the middle of it
+        for x in range(4, 8):
+            for y in range(4, 8):
+                self.store.upsert_tile(self.wm.world_id, x, y, "forest", biome="forest")
+        self.store.commit()
+        sx, sy = self.wm._open_tile(0, 0, 16, 5, 5, set())
+        tile = self.store.get_tile(self.wm.world_id, sx, sy)
+        self.assertFalse(is_solid(tile["terrain"]),
+                         f"NPC snapped to impassable {tile['terrain']} at ({sx},{sy})")
+
+    def test_npc_movement_obeys_same_rules_as_player(self):
+        from pcg.terrain import is_solid
+
+        self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        self.store.create_player(self.wm.world_id, "旅人", 8, 8, 30, 5, 2)
+        npc = self.store.npcs_near(self.wm.world_id, 8, 8, 16, limit=1)[0]
+        self.store.update_npc(npc["id"], x=8, y=8)
+        self.store.upsert_tile(self.wm.world_id, 9, 8, "forest", biome="forest")
+        self.store.commit()
+
+        npc = self.store.get_npc(npc["id"])
+        self.assertFalse(self.engine._npc_can_enter(npc, 9, 8),
+                         "an NPC must not walk through a forest the player cannot enter")
+        # ...but a stranded NPC may always step out
+        self.store.upsert_tile(self.wm.world_id, 8, 8, "forest", biome="forest")
+        self.store.commit()
+        stranded = self.store.get_npc(npc["id"])
+        self.assertTrue(self.engine._npc_can_enter(stranded, 9, 8),
+                        "an NPC stuck inside impassable terrain must be able to leave")
+        self.assertTrue(all(is_solid(t["terrain"]) for t in
+                            [self.store.get_tile(self.wm.world_id, 8, 8)]))
+
+    def test_ordinary_steps_do_not_sweep_the_whole_world(self):
+        near = self.wm.ensure_node(LOD_CHUNK, 0, 0)
+        far = self.wm.ensure_node(LOD_CHUNK, 240, 240)
+        self.engine.advance(6, 8, 8, mode="local")
+        near_after = self.store.get_node_by_id(near["id"])
+        far_after = self.store.get_node_by_id(far["id"])
+        self.assertGreater(near_after["updated_tick"], 0, "the tile you stand in must evolve")
+        self.assertEqual(far_after["updated_tick"], far["updated_tick"],
+                         "a step must not trigger a world-wide evolution sweep")
+
+        # a distant chunk ticks coarsely (distance scaling), so give it time
+        self.engine.advance(60, 8, 8, mode="world")
+        self.assertGreater(self.store.get_node_by_id(far["id"])["updated_tick"],
+                           far["updated_tick"], "wait must catch the rest of the world up")
+
     def test_social_graph_is_connected_even_without_model_relations(self):
         """Two co-located NPCs must at least know each other."""
         self.wm.ensure_node(LOD_CHUNK, 0, 0)

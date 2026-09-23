@@ -25,7 +25,7 @@ from .config import cfg_get
 from .db import Store
 from .llm import LLMClient
 from .rng import hash_int, hash_unit
-from .terrain import normalize, normalize_kind
+from .terrain import is_solid, normalize, normalize_kind
 from .tokens import estimate_tokens
 from .world import LOD_CHUNK, LOD_NAMES, LOD_REGION, LOD_WORLD, LOD_ZONE, WorldManager, _field
 
@@ -62,14 +62,18 @@ class EvolutionEngine:
     def tick(self) -> int:
         return int(self.store.get_meta("tick", 0) or 0)
 
-    def advance(self, hours: int, px: int, py: int) -> List[dict]:
-        """Advance world time and evolve every due scope, anywhere in the world.
+    def advance(self, hours: int, px: int, py: int, mode: str = "world",
+                on_scope=None) -> List[dict]:
+        """Advance world time and evolve the scopes that are due.
 
-        Scopes are *not* limited to the player's vicinity: an area the player
-        left behind must keep living, otherwise returning to it reveals a
-        frozen museum.  When a scope is overdue by several periods the elapsed
-        time is summarised in a single "catch-up" call rather than replayed
-        step by step.
+        ``mode="local"`` only touches the scope the player stands in (plus its
+        ancestors) — used for ordinary steps, where a world-wide sweep would
+        stall the game for minutes with nothing visible to show for it.
+        ``mode="world"`` sweeps every generated scope, so a place the player
+        left behind keeps living; overdue-by-several-periods scopes are
+        summarised in one "catch-up" call instead of being replayed step by
+        step.  ``on_scope`` is called before each call so the UI can say what
+        the model is working on.
         """
         if hours <= 0:
             return []
@@ -78,12 +82,17 @@ class EvolutionEngine:
         self.store.set_meta("tick", new_tick)
         if not self.enabled:
             return []
-        plan = self._plan(new_tick, px, py)
+        plan = self._plan(new_tick, px, py, mode=mode)
         budget = self.max_calls
         if any(steps >= self.catchup_steps for _, _, steps, _ in plan):
             budget = max(budget, self.max_catchup_calls)
         produced: List[dict] = []
         for lod, scope, steps, elapsed in plan[:budget]:
+            if on_scope is not None:
+                try:
+                    on_scope(lod, scope, elapsed)
+                except Exception:  # noqa: BLE001 - progress must never break play
+                    pass
             try:
                 produced.extend(self.evolve_scope(lod, scope, new_tick, px, py,
                                                   elapsed_hours=elapsed))
@@ -96,21 +105,27 @@ class EvolutionEngine:
         self.store.commit()
         return produced
 
-    def _plan(self, tick: int, px: int, py: int) -> List[Tuple[int, dict, int, int]]:
-        """(lod, node, overdue_steps, elapsed_hours) for every due scope.
+    def _plan(self, tick: int, px: int, py: int,
+              mode: str = "world") -> List[Tuple[int, dict, int, int]]:
+        """(lod, node, overdue_steps, elapsed_hours) for the scopes to evolve.
 
         Coarsest LOD first so this advance's macro events are available to the
         finer prompts that follow.  Nearest chunks come next, so a player who
         just walked somewhere always gets that place resolved first.
+
+        ``mode="local"`` restricts the plan to the player's own chunk and its
+        ancestor chain — the cheap subset that matters while walking.
         """
         dist = lambda n: abs(n["x"] - px) + abs(n["y"] - py)  # noqa: E731
         higher: List[Tuple[int, dict, int, int]] = []
         for lod in (LOD_WORLD, LOD_REGION, LOD_ZONE):
-            if lod != LOD_WORLD:
-                # only scopes that have actually been generated
-                nodes = sorted(self.store.nodes_of_lod(self.world_id, lod), key=dist)
-            else:
+            if mode == "local":
+                node = self.wm.ensure_node(lod, px, py)
+                nodes = [node] if node else []
+            elif lod == LOD_WORLD:
                 nodes = self.store.nodes_of_lod(self.world_id, LOD_WORLD)
+            else:
+                nodes = sorted(self.store.nodes_of_lod(self.world_id, lod), key=dist)
             for node in nodes:
                 elapsed = tick - int(node.get("updated_tick") or 0)
                 steps = elapsed // max(1, self.schedule[lod])
@@ -119,17 +134,24 @@ class EvolutionEngine:
         higher.sort(key=lambda t: (t[0], dist(t[1])))
 
         chunks: List[Tuple[int, dict, int, int]] = []
-        for node in sorted(self.store.nodes_of_lod(self.world_id, LOD_CHUNK), key=dist):
+        if mode == "local":
+            node = self.store.get_node(self.world_id, LOD_CHUNK,
+                                       (px // self.wm.chunk_size) * self.wm.chunk_size,
+                                       (py // self.wm.chunk_size) * self.wm.chunk_size)
+            candidates = [node] if node else []
+        else:
+            candidates = sorted(self.store.nodes_of_lod(self.world_id, LOD_CHUNK), key=dist)
+        for node in candidates:
             elapsed = tick - int(node.get("updated_tick") or 0)
             period = self._effective_period(LOD_CHUNK, dist(node))
             steps = elapsed // max(1, period)
             if steps >= 1:
                 chunks.append((LOD_CHUNK, node, steps, elapsed))
 
+        if mode == "local":
+            return higher + chunks
         local_budget = int(cfg_get(self.cfg, "evolution.max_chunk_scopes_per_advance", 2))
-        plan = higher + chunks[:local_budget]
-        plan += chunks[local_budget:]
-        return plan
+        return higher + chunks[:local_budget] + chunks[local_budget:]
 
     # ---------------------------------------------------------------- scoping
     def evolve_scope(self, lod: int, node: dict, tick: int, px: int, py: int,
@@ -375,12 +397,10 @@ class EvolutionEngine:
                 if (abs(dx) <= self.MAX_MOVE_PER_CHANGE and abs(dy) <= self.MAX_MOVE_PER_CHANGE
                         and spent + abs(dx) + abs(dy) <= self.MAX_MOVE_PER_STEP):
                     nx, ny = int(npc["x"]) + dx, int(npc["y"]) + dy
-                    if self._in_scope(node, nx, ny):
-                        tile = self.store.get_tile(self.world_id, nx, ny)
-                        if tile is None or tile["terrain"] not in ("water", "mountain", "lava"):
-                            patch["x"], patch["y"] = nx, ny
-                            if move_budget is not None:
-                                move_budget[npc["id"]] = spent + abs(dx) + abs(dy)
+                    if self._in_scope(node, nx, ny) and self._npc_can_enter(npc, nx, ny):
+                        patch["x"], patch["y"] = nx, ny
+                        if move_budget is not None:
+                            move_budget[npc["id"]] = spent + abs(dx) + abs(dy)
                 elif self.logger:
                     self.logger.info("rejected reposition of %s by (%d,%d) — too far for one step",
                                      npc["name"], dx, dy)
@@ -486,6 +506,22 @@ class EvolutionEngine:
         bucket = min(8, max(1, distance // max(1, self.wm.chunk_size * 3)))
         return base * bucket
 
+    def _npc_can_enter(self, npc: dict, x: int, y: int) -> bool:
+        """NPCs obey exactly the same terrain rules as the player.
+
+        They used to swim through forest, which made an NPC standing in the
+        middle of a wood look reachable when the player was walled out.  The
+        only allowance: an NPC currently stranded inside impassable terrain may
+        step out of it, so legacy saves cannot trap anyone forever.
+        """
+        tile = self.store.get_tile(self.world_id, x, y)
+        if tile is None:
+            return True
+        if not is_solid(tile["terrain"]):
+            return not any(o.get("solid") for o in self.store.objects_at(self.world_id, x, y))
+        here = self.store.get_tile(self.world_id, int(npc["x"]), int(npc["y"]))
+        return here is not None and is_solid(here["terrain"])
+
     def _npc_line(self, n: dict) -> str:
         """One NPC rendered for a prompt: state now + what it just did.
 
@@ -539,10 +575,7 @@ class EvolutionEngine:
                 else:
                     dy = 1 if hash_unit("sy", npc["id"], tick) > 0.5 else -1
             nx, ny = npc["x"] + dx, npc["y"] + dy
-            tile = self.store.get_tile(self.world_id, nx, ny)
-            if tile is None or tile["terrain"] in ("water", "mountain", "lava"):
-                continue
-            if self.store.objects_at(self.world_id, nx, ny):
+            if not self._npc_can_enter(npc, nx, ny):
                 continue
             self.store.update_npc(npc["id"], x=nx, y=ny, updated_tick=tick)
 

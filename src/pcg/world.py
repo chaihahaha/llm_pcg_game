@@ -321,12 +321,18 @@ class WorldManager:
                                   solid=_OBJ_SOLID.get(kind, 0), tick=tick)
 
         name_map = {}
+        occupied: set = set()
         for n in data.get("npcs", []):
             original = str(n.get("name", "无名者"))
             name = self._unique_npc_name(original)
             name_map[original.strip()] = name
+            # The model picks NPC coordinates freely and happily drops people
+            # inside a forest or a lake, where the player can never reach them.
+            # Snap them to the nearest walkable tile inside the chunk instead.
+            nx, ny = self._open_tile(ox, oy, cs, ox + int(n["x"]), oy + int(n["y"]), occupied)
+            occupied.add((nx, ny))
             self.store.add_npc(
-                self.world_id, ox + int(n["x"]), oy + int(n["y"]),
+                self.world_id, nx, ny,
                 name, race=str(n.get("race", "")), role=str(n.get("role", "")),
                 personality=str(n.get("personality", "")),
                 appearance=str(_field(n, "appearance", "look", "features", default=""))[:80],
@@ -365,6 +371,35 @@ class WorldManager:
                     self.world_id, "npc", anchor, "npc", other, "同乡", 1,
                     "在同一片区域活动，彼此认得。", tick=tick,
                 )
+
+    def _open_tile(self, ox: int, oy: int, size: int, tx: int, ty: int,
+                   occupied: set | None = None) -> Tuple[int, int]:
+        """Nearest walkable, unoccupied tile inside this chunk (ring search)."""
+        occupied = occupied or set()
+
+        def walkable(x: int, y: int) -> bool:
+            if not (ox <= x < ox + size and oy <= y < oy + size):
+                return False
+            if (x, y) in occupied:
+                return False
+            tile = self.store.get_tile(self.world_id, x, y)
+            if tile is None or is_solid(tile["terrain"]):
+                return False
+            return not any(o.get("solid") for o in self.store.objects_at(self.world_id, x, y))
+
+        if walkable(tx, ty):
+            return tx, ty
+        for r in range(1, size):
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    if max(abs(dx), abs(dy)) != r:
+                        continue
+                    if walkable(tx + dx, ty + dy):
+                        if self.logger:
+                            self.logger.info("NPC moved off impassable (%d,%d) -> (%d,%d)",
+                                             tx, ty, tx + dx, ty + dy)
+                        return tx + dx, ty + dy
+        return tx, ty
 
     def _unique_npc_name(self, name: str) -> str:
         """Names are how the player and the engine address NPCs, so they must be

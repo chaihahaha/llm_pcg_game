@@ -211,7 +211,7 @@ class Game:
                     hours = max(1, min(720, int(rest[0])))
                 except ValueError:
                     pass
-            self._report_advance(hours, f"你原地等待了 {hours} 小时。")
+            self._report_advance(hours, f"你原地等待了 {hours} 小时。", mode="world")
             print(self.draw())
             return True
         if cmd == "story":
@@ -300,9 +300,8 @@ class Game:
             if any(n["name"] == tokens[0] for n in near):
                 name = tokens[0]
                 line = tokens[1] if len(tokens) > 1 else ""
-        npc = entities.find_npc(self.store, self.world_id, name, self.player.x, self.player.y)
+        npc = self._npc_target(name, verb="交谈")
         if not npc:
-            print("附近没有人可以交谈。")
             return
         if not line:
             line = "你好。"
@@ -316,9 +315,8 @@ class Game:
 
     def _do_attack(self, name: str) -> None:
         assert self.player is not None
-        npc = entities.find_npc(self.store, self.world_id, name, self.player.x, self.player.y)
+        npc = self._npc_target(name, verb="攻击")
         if not npc:
-            print("附近没有可攻击的目标。")
             return
         result = entities.attack(self.store, self.world_id, self.player, npc, self.tick())
         for line in result["log"]:
@@ -333,6 +331,33 @@ class Game:
             print("你倒下了。世界仍在运转……")
         print(self.draw())
 
+    def _npc_target(self, name: str, verb: str = "交谈"):
+        """Resolve a talk/attack target, explaining *why* it is not usable.
+
+        "附近没有人" is unhelpful when the person you named is standing four
+        tiles away inside a thicket: the player needs to be told the distance
+        and the fact that they are not adjacent.
+        """
+        assert self.player is not None
+        npc = entities.find_npc(self.store, self.world_id, name, self.player.x, self.player.y)
+        if npc:
+            return npc
+        if name:
+            far = self.store.find_npc_by_name(self.world_id, name)
+            if far:
+                d = abs(far["x"] - self.player.x) + abs(far["y"] - self.player.y)
+                print(f"{name} 在 ({far['x']},{far['y']})，离你 {d} 格，无法{verb}（需要相邻）。")
+                return None
+            print(f"这里没有叫「{name}」的人。")
+            return None
+        near = self.store.npcs_near(self.world_id, self.player.x, self.player.y, 6, limit=5)
+        if near:
+            listing = "，".join(f"{n['name']}[{n['x']},{n['y']}]" for n in near)
+            print(f"附近没有相邻的人，无法{verb}。可见：{listing}")
+        else:
+            print(f"附近没有可{verb}的目标。")
+        return None
+
     def _resolve_npc_turn(self) -> None:
         assert self.player is not None
         for npc in self.store.npcs_at(self.world_id, self.player.x, self.player.y):
@@ -341,10 +366,23 @@ class Game:
                 print(line)
         self.player.refresh()
 
-    def _advance(self, hours: int, note: str = "") -> str:
-        """Move time forward; returns what is worth telling the player."""
+    def _progress(self, lod: int, node: dict, elapsed: int) -> None:
+        """Say what the model is working on, so a slow local model is legible
+        instead of looking like a freeze."""
+        name = {0: "世界", 1: "区域", 2: "子区域", 3: "地块"}.get(lod, "?")
+        extra = f"，补算 {elapsed} 小时" if elapsed > 48 else ""
+        print(f"  ⟳ 推演{name}「{node.get('name', '')}」{extra} …", flush=True)
+
+    def _advance(self, hours: int, note: str = "", mode: str = "local") -> str:
+        """Move time forward; returns what is worth telling the player.
+
+        Ordinary steps use ``mode="local"`` (only the tile you stand in and its
+        ancestors), so walking never triggers a minutes-long world-wide sweep.
+        ``wait`` uses ``mode="world"`` to catch the rest of the world up.
+        """
         assert self.player is not None
-        events = self.evolution.advance(hours, self.player.x, self.player.y)
+        events = self.evolution.advance(hours, self.player.x, self.player.y, mode=mode,
+                                        on_scope=self._progress)
         self._resolve_npc_turn()
         self.save()
         lines: List[str] = []
@@ -358,8 +396,8 @@ class Game:
                 lines.append(f"※ 新任务「{q['title']}」：{q.get('data', {}).get('objective', '')}")
         return "\n".join(lines)
 
-    def _report_advance(self, hours: int, note: str = "") -> None:
-        msg = self._advance(hours, note)
+    def _report_advance(self, hours: int, note: str = "", mode: str = "local") -> None:
+        msg = self._advance(hours, note, mode=mode)
         if msg:
             print(msg)
 
@@ -378,7 +416,8 @@ class Game:
                     moved += 1
                     break
             self.wm.mark_explored(self.player.x, self.player.y)
-            self.evolution.advance(1, self.player.x, self.player.y)
+            self.evolution.advance(1, self.player.x, self.player.y, mode="local",
+                                   on_scope=self._progress)
             self._resolve_npc_turn()
         self.save()
         print(f"自动探索 {steps} 步（实际移动 {moved} 格），当前座标 ({self.player.x},{self.player.y})")
