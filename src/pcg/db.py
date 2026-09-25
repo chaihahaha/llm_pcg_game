@@ -256,7 +256,14 @@ CREATE TABLE IF NOT EXISTS llm_cache (
 
 
 def _dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # a lone surrogate slipped in from somewhere; escaped ASCII JSON is
+        # still valid and readable by json.loads on the way back out
+        text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
+    return text
 
 
 def _loads(text: Optional[str], default: Any) -> Any:

@@ -15,7 +15,10 @@ T = TypeVar("T")
 
 
 def _digest(*parts) -> str:
-    return hashlib.sha256("|".join(str(p) for p in parts).encode("utf-8")).hexdigest()
+    # surrogatepass keeps hashing total: a lone surrogate (which can arrive
+    # from a terminal) must never be able to raise here.
+    blob = "|".join(str(p) for p in parts).encode("utf-8", "surrogatepass")
+    return hashlib.sha256(blob).hexdigest()
 
 
 def hash_unit(*parts) -> float:

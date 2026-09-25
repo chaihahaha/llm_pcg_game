@@ -21,6 +21,7 @@ from .llm import LLMClient
 from .narrative import Narrator
 from .rng import hash_int
 from .rules import RuntimeRules
+from .tokens import sanitize_text
 from .world import LOD_CHUNK, WorldManager
 
 _DIRS = ["w", "a", "s", "d", "n", "e", "s", "w"]
@@ -193,7 +194,9 @@ class Game:
 
     # -------------------------------------------------------------- commands
     def execute(self, line: str) -> bool:
-        line = (line or "").strip()
+        # terminal input can carry lone surrogates (see tokens.sanitize_text);
+        # clean at the single entry point so nothing downstream has to care
+        line = sanitize_text(line or "").strip()
         if not line:
             return True
         parts = line.split()
@@ -645,6 +648,7 @@ class Game:
             except (EOFError, KeyboardInterrupt):
                 print("\n再见。")
                 break
+            line = sanitize_text(line)
             try:
                 if not self.execute(line):
                     break

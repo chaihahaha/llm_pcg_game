@@ -18,6 +18,25 @@ from typing import Iterable
 _CJK = re.compile(r"[\u2e80-\u9fff\u3000-\u303f\uff00-\uffef]")
 _ASCII = re.compile(r"[A-Za-z0-9]")
 _MARKER_TOKENS = 3  # chat template overhead per message
+_SURROGATES = re.compile("[\ud800-\udfff]")
+
+
+def sanitize_text(text: str) -> str:
+    """Make text safe to encode as UTF-8.
+
+    On POSIX, Python configures stdin/stdout with ``errors='surrogateescape'``,
+    so a stray or truncated byte from an IME, a bracketed paste or a terminal
+    encoding mismatch arrives as a *lone surrogate* (``\\udce4``) instead of
+    raising.  A lone surrogate is not a real character and cannot be encoded to
+    UTF-8, so it becomes a landmine for every later ``.encode("utf-8")``, SQLite
+    write or ``json.dumps``.  Recover the original bytes and replace the
+    undecodable ones with U+FFFD.
+    """
+    if not text:
+        return text
+    if not _SURROGATES.search(text):
+        return text
+    return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
 def estimate_tokens(text: str) -> int:

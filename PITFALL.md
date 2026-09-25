@@ -228,3 +228,20 @@ chunk 周期是 6 游戏小时，于是每 6 步所有已探索地块一起到�
 模型写坏补丁是常态，因此：补丁存表并带 `enabled`；读档时逐个重新编译，
 失败的**自动停用并报错**；hook 抛异常一律被 `try/except` 兜住返回默认值；
 `rules` 命令直接打印补丁源码，`do` 被拒绝时说明触发了哪条沙箱规则。
+
+## 31. `UnicodeEncodeError: surrogates not allowed` —— 终端偶发坏字节
+
+**现象**：`talk 巴洛 不行就打一架` 偶尔报
+`'utf-8' codec can't encode character '\udce4'`，重打一遍就好了。
+**原因**：POSIX 上 Python 把 `sys.stdin`/`sys.stdout` 配成 `errors='surrogateescape'`。
+终端送进来的**残字节**（输入法/终端把多字节字符截断、bracketed paste 混入控制字节、
+编码不匹配）不会被解码失败，而是被映射成**孤立代理项** `\udcXX`。
+孤立代理项不是合法字符、没有 UTF-8 表示，于是后面任何
+`.encode("utf-8")` / SQLite 写入 / `json.dumps(..., ensure_ascii=False)` 都会炸。
+第一次输入带坏字节、第二次没有，所以表现为"偶发、重打就好"。
+**修复**（边界消毒 + 关键路径做全函数）：
+* `tokens.sanitize_text()`：用 `encode("utf-8","surrogateescape").decode("utf-8","replace")`
+  把坏字节还原后替换为 U+FFFD；在 `Game.execute()` 与交互输入的**唯一入口**调用。
+* `rng._digest()` 改用 `encode("utf-8","surrogatepass")`，哈希对任意字符串都不会抛错。
+* `db._dumps()` 若 `ensure_ascii=False` 的结果无法编码，退回 `ensure_ascii=True`（仍是合法 JSON）。
+* `llm` 读取响应改用 `decode("utf-8","replace")`，一个坏字节不会毁掉一次生成。

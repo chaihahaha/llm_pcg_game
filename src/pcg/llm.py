@@ -120,7 +120,8 @@ class _HTTPBackend:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+            # 'replace' so one bad byte in a response cannot kill the turn
+            body = json.loads(resp.read().decode("utf-8", "replace"))
         choices = body.get("choices") or []
         if not choices:
             raise LLMError(f"empty choices: {str(body)[:300]}")

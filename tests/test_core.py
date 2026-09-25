@@ -14,7 +14,7 @@ from pcg import rng, terrain  # noqa: E402
 from pcg.config import load_config  # noqa: E402
 from pcg.db import Store  # noqa: E402
 from pcg.llm import MockBackend, parse_json_loose  # noqa: E402
-from pcg.tokens import clamp_text, estimate_tokens  # noqa: E402
+from pcg.tokens import clamp_text, estimate_tokens, sanitize_text  # noqa: E402
 
 
 def tmp_db(name: str) -> str:
@@ -36,6 +36,30 @@ class TestTokens(unittest.TestCase):
         out = clamp_text(text, 50)
         self.assertLessEqual(estimate_tokens(out), 60)
         self.assertIn("截断", out)
+
+
+class TestSanitize(unittest.TestCase):
+    """Terminal input can carry lone surrogates; nothing may crash on them."""
+
+    def test_replaces_lone_surrogates(self):
+        dirty = "talk 巴洛 \udce4不行就打一架"
+        clean = sanitize_text(dirty)
+        self.assertNotIn("\udce4", clean)
+        self.assertIn("巴洛", clean)
+        clean.encode("utf-8")          # must not raise
+
+    def test_clean_text_is_untouched(self):
+        self.assertEqual(sanitize_text("你好 world"), "你好 world")
+        self.assertEqual(sanitize_text(""), "")
+
+    def test_hashing_is_total(self):
+        self.assertIsInstance(rng.hash_int("x\udce4y", mod=97), int)
+
+    def test_json_dump_survives_surrogates(self):
+        from pcg.db import _dumps
+        text = _dumps({"a": "坏\udce4字节"})
+        text.encode("utf-8")           # must not raise
+        self.assertIn("a", text)
 
 
 class TestRng(unittest.TestCase):
