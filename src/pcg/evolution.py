@@ -25,9 +25,12 @@ from .config import cfg_get
 from .db import Store
 from .llm import LLMClient
 from .rng import hash_int, hash_unit
+from .sim import Simulator, sim_digest
 from .terrain import is_solid, normalize, normalize_kind
 from .tokens import estimate_tokens
 from .world import LOD_CHUNK, LOD_NAMES, LOD_REGION, LOD_WORLD, LOD_ZONE, WorldManager, _field
+
+_EMPTY_VALUES = {"", "无", "none", "null", "n/a", "na", "-", "未知", "未定", "不详"}
 
 _MAX_TOKEN_TASKS = 3600
 
@@ -58,6 +61,8 @@ class EvolutionEngine:
         self.catchup_steps = int(cfg_get(cfg, "evolution.catchup_steps", 3))
         self.max_catchup_calls = int(cfg_get(cfg, "evolution.max_catchup_calls", 8))
         self.distance_scaling = bool(cfg_get(cfg, "evolution.distance_scaling", True))
+        # the deterministic substrate runs on every advance, with zero LLM calls
+        self.sim = Simulator(store, wm, rules, logger) if rules is not None else None
 
     # ------------------------------------------------------------------ tick
     def tick(self) -> int:
@@ -83,6 +88,11 @@ class EvolutionEngine:
         self.store.set_meta("tick", new_tick)
         if not self.enabled:
             return []
+        # 1) cheap deterministic continuity: needs, thresholds, decay, spoilage
+        sim_events: List[dict] = []
+        if self.sim is not None:
+            sim_events = self.sim.step(new_tick, int(hours), px, py)
+        # 2) the LLM only gets the scopes that are actually due
         plan = self._plan(new_tick, px, py, mode=mode)
         budget = self.max_calls
         if any(steps >= self.catchup_steps for _, _, steps, _ in plan):
@@ -104,7 +114,7 @@ class EvolutionEngine:
         self._npc_drift(px, py, new_tick)
         self.store.prune_events(self.world_id)
         self.store.commit()
-        return produced
+        return sim_events + produced
 
     def _plan(self, tick: int, px: int, py: int,
               mode: str = "world") -> List[Tuple[int, dict, int, int]]:
@@ -418,8 +428,11 @@ class EvolutionEngine:
                 elif self.logger:
                     self.logger.info("rejected reposition of %s by (%d,%d) — too far for one step",
                                      npc["name"], dx, dy)
-            if ch.get("mood"):
-                patch["mood"] = str(ch["mood"])[:16]
+            mood = str(ch.get("mood", "")).strip()[:16]
+            # models occasionally emit a placeholder ("无", "none") instead of an
+            # emotion; that is not a mood and must not overwrite a real one
+            if mood and mood.lower() not in _EMPTY_VALUES:
+                patch["mood"] = mood
             if ch.get("status"):
                 patch["status"] = str(ch["status"])[:24]
             note = str(ch.get("note", ""))[:80]
@@ -566,6 +579,9 @@ class EvolutionEngine:
         if n.get("appearance"):
             bits.append(f"外貌{n['appearance'][:24]}")
         line = "".join(bits) + "]"
+        # give the model the substrate's numbers, so it narrates facts instead
+        # of inventing whether someone is hungry
+        line += f"(需求：{sim_digest(n, int((n.get('updated_tick') or 0)))})"
         last = (n.get("state") or {}).get("last")
         if last:
             line += f"(上一步：{str(last)[:40]})"

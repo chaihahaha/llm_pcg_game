@@ -688,6 +688,21 @@ class Store:
         vals.append(npc_id)
         self.conn.execute(f"UPDATE npcs SET {', '.join(sets)} WHERE id=?", vals)
 
+    def list_npcs(self, world_id: int, alive_only: bool = True) -> List[dict]:
+        q = "SELECT * FROM npcs WHERE world_id=?"
+        if alive_only:
+            q += " AND alive=1"
+        rows = self.conn.execute(q + " ORDER BY id", (world_id,)).fetchall()
+        return [self._npc(r) for r in rows]
+
+    def list_objects(self, world_id: int, alive_only: bool = True,
+                     limit: int = 500) -> List[dict]:
+        q = "SELECT * FROM objects WHERE world_id=?"
+        if alive_only:
+            q += " AND alive=1"
+        rows = self.conn.execute(q + " ORDER BY id LIMIT ?", (world_id, limit)).fetchall()
+        return [self._obj(r) for r in rows]
+
     def count_npcs(self, world_id: int, alive_only: bool = True) -> int:
         q = "SELECT COUNT(*) c FROM npcs WHERE world_id=?"
         if alive_only:

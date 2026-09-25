@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .sandbox import SandboxError, compile_hook, exec_patch, validate_code
 
-HOOKS = ("can_enter", "on_enter", "damage", "speech", "move_cost", "evolve_bias")
+HOOKS = ("can_enter", "on_enter", "damage", "speech", "move_cost", "evolve_bias", "sim_npc")
 
 DEFAULTS: Dict[str, Any] = {
     "npc_speech_max_chars": 0,      # 0 = unlimited
@@ -33,6 +33,19 @@ DEFAULTS: Dict[str, Any] = {
     "forbidden_words": [],
     "evolution_bias": "",
     "action_cost_multiplier": 1.0,
+    # --- deterministic substrate knobs: the LLM may rewrite any of these -----
+    "hunger_rate": 4.0,             # need gained per 24h
+    "fatigue_rate": 6.0,
+    "anger_rate": 0.5,
+    "morale_rate": 3.0,             # morale lost per 24h
+    "eat_at": 65.0,                 # hunger at which an NPC forages
+    "starve_at": 90.0,              # hunger at which HP starts dropping
+    "starve_hp_loss": 1.0,          # HP per 6h while starving
+    "anger_attack_at": 70.0,        # anger at which an adjacent NPC turns hostile
+    "mood_override_hours": 12,      # how long an LLM-written mood outranks the formula
+    "fire_burnout_hours": 48.0,
+    "food_spoil_hours": 72.0,
+    "relation_decay": 1.0,          # points per week toward neutral
 }
 
 _RULE_DOC = {
@@ -45,6 +58,17 @@ _RULE_DOC = {
     "forbidden_words": "list[str]，NPC 对话中禁止出现的词，出现则被替换为***",
     "evolution_bias": "str，附加到所有演化提示词里的世界走向指令",
     "action_cost_multiplier": "float，自由动作耗时倍率",
+    "hunger_rate": "float 0-50，NPC 每 24h 增长的饥饿",
+    "fatigue_rate": "float 0-50，每 24h 增长的疲惫",
+    "morale_rate": "float 0-50，每 24h 流失的士气",
+    "eat_at": "float 0-100，饥饿到多少会去找吃的",
+    "starve_at": "float 0-100，饥饿到多少开始掉血",
+    "starve_hp_loss": "float 0-10，挨饿时每 6h 掉多少血",
+    "anger_attack_at": "float 0-100，愤怒到多少会动手",
+    "mood_override_hours": "int 0-240，LLM 指定的情绪压过公式多久",
+    "fire_burnout_hours": "float 0-1000，火多久烧尽",
+    "food_spoil_hours": "float 0-1000，食物多久腐败",
+    "relation_decay": "float 0-5，关系每周向中立回落多少",
 }
 
 _RULE_BOUNDS = {
@@ -53,7 +77,76 @@ _RULE_BOUNDS = {
     "damage_multiplier": (0.0, 20.0),
     "heal_multiplier": (0.0, 20.0),
     "action_cost_multiplier": (0.0, 50.0),
+    "hunger_rate": (0.0, 50.0), "fatigue_rate": (0.0, 50.0), "morale_rate": (0.0, 50.0),
+    "anger_rate": (0.0, 50.0),
+    "eat_at": (0.0, 100.0), "starve_at": (0.0, 100.0), "anger_attack_at": (0.0, 100.0),
+    "starve_hp_loss": (0.0, 10.0),
+    "mood_override_hours": (0, 240),
+    "fire_burnout_hours": (0.0, 1000.0), "food_spoil_hours": (0.0, 1000.0),
+    "relation_decay": (0.0, 5.0),
 }
+
+
+# Models rarely reproduce our exact identifiers ("hunger_rate" came back as
+# "hunger_growth_multiplier").  Rejecting a plausible synonym silently would be
+# the worst outcome: the world simply would not change and nobody would know.
+_RULE_ALIASES: Dict[str, str] = {
+    "hunger_growth_multiplier": "hunger_rate", "hunger_growth": "hunger_rate",
+    "hunger_multiplier": "hunger_rate", "hunger_increase_rate": "hunger_rate",
+    "starvation_rate": "hunger_rate", "hunger_speed": "hunger_rate",
+    "fatigue_growth_multiplier": "fatigue_rate", "fatigue_growth": "fatigue_rate",
+    "fatigue_multiplier": "fatigue_rate", "exhaustion_rate": "fatigue_rate",
+    "morale_decay_rate": "morale_rate", "morale_loss_rate": "morale_rate",
+    "morale_growth": "morale_rate",
+    "anger_decay_rate": "anger_rate", "anger_growth": "anger_rate",
+    "eat_threshold": "eat_at", "forage_at": "eat_at", "hunger_eat_threshold": "eat_at",
+    "starvation_threshold": "starve_at", "starve_threshold": "starve_at",
+    "starve_damage": "starve_hp_loss", "starvation_damage": "starve_hp_loss",
+    "anger_attack_threshold": "anger_attack_at", "violence_threshold": "anger_attack_at",
+    "speech_limit": "npc_speech_max_chars", "npc_speech_limit": "npc_speech_max_chars",
+    "max_speech_chars": "npc_speech_max_chars", "speech_max_length": "npc_speech_max_chars",
+    "movement_cost_hours": "move_cost_hours", "move_cost": "move_cost_hours",
+    "damage_multiplier_global": "damage_multiplier", "global_damage_multiplier": "damage_multiplier",
+    "fire_duration_hours": "fire_burnout_hours", "fire_lifetime": "fire_burnout_hours",
+    "food_spoil_time": "food_spoil_hours", "spoil_hours": "food_spoil_hours",
+    "relationship_decay": "relation_decay", "relation_decay_rate": "relation_decay",
+}
+
+# vocabulary so "threshold" can find "at", "growth" can find "rate", ...
+_RULE_SYNONYMS = {
+    "rate": {"rate", "growth", "speed", "multiplier", "perday", "perhour", "coef", "coefficient"},
+    "at": {"at", "threshold", "limit", "point", "level", "when"},
+    "hours": {"hours", "hour", "duration", "time", "lifetime"},
+    "loss": {"loss", "damage", "drain", "cost"},
+    "multiplier": {"multiplier", "factor", "scale", "ratio"},
+}
+
+
+def resolve_rule_key(key: str) -> Optional[str]:
+    """Map a model-invented rule name onto a real one, or None."""
+    if not key:
+        return None
+    raw = str(key).strip().strip("'\"")
+    norm = raw.lower().replace("-", "_").replace(" ", "_")
+    if norm in DEFAULTS:
+        return norm
+    if norm in _RULE_ALIASES:
+        return _RULE_ALIASES[norm]
+    tokens = [t for t in norm.split("_") if t]
+    if not tokens:
+        return None
+    best, best_score = None, 0.0
+    for canonical in DEFAULTS:
+        want = canonical.split("_")
+        hits = 0.0
+        for w in want:
+            pool = _RULE_SYNONYMS.get(w, {w})
+            if any(t in pool or t == w for t in tokens):
+                hits += 1.0
+        score = hits / len(want)
+        if score > best_score:
+            best, best_score = canonical, score
+    return best if best_score >= 0.75 else None
 
 
 class RuntimeRules:
@@ -66,6 +159,7 @@ class RuntimeRules:
         self.sources: Dict[str, dict] = {}   # target -> patch row
         self.api: Dict[str, Any] = {}
         self.code_errors: List[str] = []
+        self.patch_failures: List[str] = []
         self.load()
 
     def bind_api(self, api: Dict[str, Any]) -> None:
@@ -76,8 +170,17 @@ class RuntimeRules:
         they install comes back with the save.
         """
         self.api = dict(api)
-        self.api["set_rule"] = lambda key, value, reason="": self.set_rule(
-            str(key), value, reason=str(reason), tick=self._tick(), source="code")[0]
+
+        def _set(key, value, reason="", tick=None):
+            # a rejected rule inside a patch must be visible, never silent
+            ok, msg = self.set_rule(str(key), value, reason=str(reason),
+                                    tick=self._tick() if tick is None else int(tick),
+                                    source="code")
+            if not ok:
+                self.patch_failures.append(msg)
+            return ok
+
+        self.api["set_rule"] = _set
         self.api["add_hook"] = lambda hook, fn, reason="": self.add_hook_callable(
             str(hook), fn, reason=str(reason))
         self.api["rules"] = self.rules
@@ -123,6 +226,7 @@ class RuntimeRules:
         source = row.get("expr") or ""
         if not self.api:
             return True, ""   # nothing bound yet; will run on bind
+        self.patch_failures = []
         try:
             exec_patch(source, {"api": self.api})
         except SandboxError as exc:
@@ -158,7 +262,12 @@ class RuntimeRules:
         self.store.commit()
         row = self.store.get_patch(self.world_id, "code", "code")
         ok, msg = self._run_code(row or {}, reapply=True)
-        return (True, "代码补丁已生效") if ok else (False, msg)
+        if not ok:
+            return False, msg
+        if self.patch_failures:
+            return True, ("代码补丁已生效，但其中有条目被拒绝："
+                          + "；".join(self.patch_failures[:3]))
+        return True, "代码补丁已生效"
 
     def add_hook_callable(self, hook: str, fn: Callable, reason: str = "") -> bool:
         """In-memory hook registration (used by code patches; re-created on load)."""
@@ -204,7 +313,7 @@ class RuntimeRules:
     @staticmethod
     def validate_rule(key: str, value: Any) -> Tuple[bool, str]:
         if key not in DEFAULTS:
-            return False, f"未知规则 {key}"
+            return False, f"未知规则 {key}（可用：{', '.join(sorted(DEFAULTS))}）"
         bounds = _RULE_BOUNDS.get(key)
         if bounds:
             try:
@@ -225,8 +334,18 @@ class RuntimeRules:
 
     def set_rule(self, key: str, value: Any, reason: str = "", tick: int = 0,
                  source: str = "llm") -> Tuple[bool, str]:
+        canonical = resolve_rule_key(key)
+        if canonical is None:
+            msg = f"未知规则 {key}（可用：{', '.join(sorted(DEFAULTS))}）"
+            self.patch_failures.append(msg)
+            return False, msg
+        if canonical != str(key).strip():
+            if self.logger:
+                self.logger.info("rule %r resolved to %r", key, canonical)
+        key = canonical
         ok, msg = self.validate_rule(key, value)
         if not ok:
+            self.patch_failures.append(msg)
             return False, msg
         if key in _RULE_BOUNDS:
             lo, hi = _RULE_BOUNDS[key]

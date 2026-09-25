@@ -245,3 +245,31 @@ chunk 周期是 6 游戏小时，于是每 6 步所有已探索地块一起到�
 * `rng._digest()` 改用 `encode("utf-8","surrogatepass")`，哈希对任意字符串都不会抛错。
 * `db._dumps()` 若 `ensure_ascii=False` 的结果无法编码，退回 `ensure_ascii=True`（仍是合法 JSON）。
 * `llm` 读取响应改用 `decode("utf-8","replace")`，一个坏字节不会毁掉一次生成。
+
+## 32. 让 LLM 做算术：既慢又差，还会让世界停摆
+
+**问题**：把"NPC 什么时候饿、难过多久会发脾气"交给 LLM，代价是每次 30–45 秒、
+结果不确定，而且**玩家不行动世界就不演化**。
+**修复**：新增确定性基座 `sim.py`（闭式积分，零 LLM 调用），
+LLM 只负责初始化气质、读数字写叙事、用 `sim_npc` 钩子逐人干预、用补丁改基座常数。
+
+## 33. 闭式积分里的 falsy-zero
+
+**现象**：篝火永远不熄灭，食物永远不腐败。
+**原因**：`age = tick - int(obj.get("created_tick") or tick)` —— `created_tick` 合法地等于 0，
+被 `or` 当成假值替换成了 `tick`，于是 age 永远为 0。
+**修复**：显式判 `None`：`created = obj.get("created_tick"); tick if created is None else int(created)`。
+单元测试正是靠这个暴露出来的。
+
+## 34. 模型猜错规则名，而拒绝是静默的
+
+**现象**：模型想"取消饥饿"，写成 `api['set_rule']('hunger_growth_multiplier', 0)`；
+我们只认 `hunger_rate`，于是拒绝——但代码补丁报告"已生效"，世界毫无变化。
+**修复**：`resolve_rule_key()` 三级解析（精确 → 别名 → 词元同义词打分）；
+失败写入 `patch_failures` 并在 `rules` 里显式显示。
+实测该存档重载后，原本失效的补丁自动生效。
+
+## 35. LLM 会用占位符当情绪
+
+**现象**：NPC 的 `mood` 被写成 `"无"`（模型表示"没有特别情绪"）。
+**修复**：`{"", "无", "none", "null", "n/a", "-", "未知"}` 一律视为空，不覆盖已有情绪。

@@ -425,6 +425,15 @@ class MockBackend:
                 eff.insert(0, {"op": "destroy_object", "id": int(ids[0]), "desc": "断口新鲜的树桩。"})
             return {"feasible": True, "action": "chop", "narrative": "你抡起斧子，树身发出一声闷响。",
                     "cost_hours": 1, "effects": eff}
+        if any(k in intent for k in ("进食", "饥饿", "挨饿", "不必再吃", "不吃")):
+            return {
+                "feasible": True, "action": "end_hunger",
+                "narrative": "你念出古老的词句，这片土地上的活物忽然不再感到饥饿——某种更底层的秩序被改写了。",
+                "cost_hours": 0, "effects": [
+                    {"op": "event", "kind": "magic", "text": "一道改写生死的律令落下，饥饿从此与这片土地无关。"}],
+                "patch": {"kind": "rule", "key": "hunger_rate", "value": 0,
+                          "reason": "玩家以律令取消了饥饿"},
+            }
         if any(k in intent for k in ("不能说话", "闭嘴", "字符", "字数", "沉默", "禁言",
                                      "所有人", "NPC", "说长", "短句", "语言")):
             return {
