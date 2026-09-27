@@ -303,6 +303,8 @@ class MockBackend:
                  "b": pick(_MOCK_GIVEN, seed, "cn2") + pick(_MOCK_SURNAME, seed, "cs2"),
                  "kind": "雇主", "value": 2, "note": "一人雇另一人看守遗迹入口。"},
             ],
+            "terrain_names": {"s": "锈砂垄", "m": "酸泥滩", "T": "铁叶林",
+                              "~": "钝水潭", "%": "余烬渗层"},
         }
 
     def _t_tile(self, messages, seed) -> dict:

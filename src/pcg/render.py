@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple
 
-from .terrain import TERRAIN, symbol_of
+from .terrain import TERRAIN, default_desc, symbol_of
 
 OBJ_SYM = {
     "rock": "o", "ruin": "+", "plant": "v", "tree": "T", "arcane": "%",
@@ -14,13 +14,82 @@ OBJ_SYM = {
     "altar": "&", "corpse": "x", "creature": "c", "object": "o", "feature": "o",
 }
 
+OBJ_LABEL = {
+    "rock": "岩石", "ruin": "残骸", "plant": "植物", "tree": "树木", "arcane": "魔力物",
+    "building": "建筑", "item": "物品", "ore": "矿脉", "water": "水源", "track": "痕迹",
+    "altar": "祭坛", "corpse": "尸骸", "creature": "生物", "object": "物体", "feature": "地物",
+}
+
 RUBBLE_SYM = "x"     # destroyed objects stay on the map as ruins
 CORPSE_SYM = "†"     # so do the dead, otherwise killing leaves no trace
+
+
+def default_label(terrain: str) -> str:
+    return default_desc(terrain)
 
 
 def _npc_char(npc: dict) -> str:
     name = str(npc.get("name") or "?")
     return name[0] if name else "?"
+
+
+def legend_line(wm, tiles: Dict, objs) -> str:
+    """Explain exactly the symbols the player can currently see.
+
+    The legend used to be a hardcoded subset, so `s` (sand), `m` (swamp),
+    `!` (lava), `O` (cave) and friends appeared on screen with no explanation.
+    It is now derived from the view itself, and enriched with whatever local
+    names the model invented for those codes ("s=沙地（硫磺沙脊）").
+    """
+    glossary = {}
+    try:
+        glossary = wm.glossary()
+    except Exception:  # noqa: BLE001 - a missing glossary must not break drawing
+        glossary = {}
+
+    present = {t["terrain"] for t in tiles.values() if isinstance(t, dict)} if tiles else set()
+    # always explain the ones you will meet anywhere, then anything else on screen
+    core = {"water", "grass", "forest", "hill", "mountain", "sand", "swamp"}
+    entries = []
+    for terrain, (symbol, _solid, label) in TERRAIN.items():
+        if terrain not in present and terrain not in core:
+            continue
+        local = glossary.get(symbol) or glossary.get(terrain)
+        name = label
+        if local and local not in (label, terrain):
+            name = f"{label}·{local}"
+        entries.append(f"{symbol}={name}")
+
+    # Object kinds share symbols with terrain on purpose (a ruin object looks
+    # like ruins) — so fold them into the same entry instead of printing a
+    # self-contradictory "+=遗迹" next to "+=ruin".
+    by_symbol: Dict[str, str] = {}
+    for entry in entries:
+        sym = entry.split("=", 1)[0]
+        by_symbol[sym] = entry.split("=", 1)[1]
+
+    # objects are resolved per *instance*: a destroyed thing draws as rubble,
+    # not as its old kind, so the legend must follow the same mapping as the map
+    seen: Dict[str, str] = {}
+    for o in (objs or []):
+        alive = o.get("alive", 1)
+        kind = o.get("kind", "object")
+        sym = OBJ_SYM.get(kind, "o") if alive else RUBBLE_SYM
+        label = OBJ_LABEL.get(kind, kind) if alive else "残迹"
+        seen.setdefault(sym, label)
+
+    extra = []
+    for sym, label in seen.items():
+        if sym in by_symbol:
+            if label not in by_symbol[sym]:
+                by_symbol[sym] = f"{by_symbol[sym]}/{label}"
+        elif label not in extra:
+            extra.append(f"{sym}={label}")
+
+    tail = "@=你 汉字=人物 †=尸体"
+    first = "符号：" + " ".join(f"{s}={v}" for s, v in by_symbol.items())
+    second = "      " + " ".join(extra + [tail])
+    return first + "\n" + second
 
 
 def render_view(wm, cx: int, cy: int, size: int = 16, player=None) -> str:
@@ -64,10 +133,7 @@ def render_view(wm, cx: int, cy: int, size: int = 16, player=None) -> str:
         lines.append(f"{y0 + j:4d}{row}{marker}")
 
     lines.append("")
-    lines.append("符号：" + " ".join(f"{v[0]}={k}" for k, v in TERRAIN.items() if k in
-                                     ("water", "grass", "tall_grass", "forest", "hill",
-                                      "mountain", "ruins", "farm", "road", "arcane")))
-    lines.append("      o=物体 +=遗迹 %=魔力 b=建筑 v=植物 @=你 汉字=人物 †=尸体")
+    lines.append(legend_line(wm, tiles, objs))
     if npcs:
         near = sorted(npcs, key=lambda n: abs(n["x"] - cx) + abs(n["y"] - cy))[:6]
         lines.append("附近人物：" + "，".join(
@@ -83,9 +149,20 @@ def render_tile_info(wm, x: int, y: int, describe: bool = True) -> str:
     zone = wm.ensure_node(2, x, y)
     region = wm.ensure_node(1, x, y)
 
+    local = {}
+    try:
+        local = wm.glossary()
+    except Exception:  # noqa: BLE001
+        local = {}
+    local_name = local.get(symbol_of(tile["terrain"])) or local.get(tile["terrain"])
+    terrain_label = f"地形：{tile.get('name') or default_label(tile['terrain'])}" \
+                    f"（{tile['terrain']}"
+    if local_name and local_name not in (tile.get("name") or ""):
+        terrain_label += f"，本地称「{local_name}」"
+    terrain_label += "）"
     lines = [
         f"=== 格子 ({x}, {y}) ===",
-        f"地形：{tile.get('name') or tile['terrain']}（{tile['terrain']}）",
+        terrain_label,
         f"归属：{region.get('name','')} › {zone.get('name','')} › {chunk.get('name','')}",
         f"描述：{tile.get('desc') or '（尚未细看）'}",
     ]
@@ -157,6 +234,7 @@ def render_help() -> str:
         "                          例：do 向下挖一条通往地底的竖井    未识别的输入默认走这里\n"
         "  actions                  查看已学会的动作（可重复 do <名字>）\n"
         "  rules                    查看被改写过的世界法则与钩子（monkey patch）\n"
+        "  legend                   查看完整符号表与本世界的地名用词\n"
         "  story                    查看当前任务\n"
         "  newstory                 让说书人立刻生成新任务\n"
         "  journal [n]              查看最近事件\n"

@@ -162,6 +162,34 @@ class WorldManager:
             raise RuntimeError("world node missing; call create() first")
         return node
 
+    def glossary(self) -> Dict[str, str]:
+        """Local names the model invented for terrain codes, e.g. {'s': '硫磺沙脊'}."""
+        world = self.store.get_world(self.world_id) or {}
+        raw = (world.get("data") or {}).get("glossary") or {}
+        return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+    def merge_glossary(self, names) -> None:
+        """Record the model's wording for terrain codes so the legend can explain them."""
+        if not isinstance(names, dict) or not names:
+            return
+        world = self.store.get_world(self.world_id) or {}
+        data = dict(world.get("data") or {})
+        glossary = dict(data.get("glossary") or {})
+        changed = False
+        for key, value in list(names.items())[:24]:
+            label = str(value).strip()[:12]
+            if not label:
+                continue
+            raw = str(key).strip()
+            code = raw if raw in CODE_TO_TERRAIN else symbol_of(normalize(raw))
+            if code and glossary.get(code) != label:
+                glossary[code] = label
+                changed = True
+        if changed:
+            data["glossary"] = glossary
+            self.store.update_world(self.world_id, data=data)
+            self.store.commit()
+
     def world_bible(self, extra: str = "") -> str:
         world = self.store.get_world(self.world_id) or {}
         nations = self.store.list_nations(self.world_id)
@@ -281,6 +309,10 @@ class WorldManager:
             rows = self._rows_from_patches(patches, seed, nx, ny, size, parent)
         else:
             rows = self._clean_rows(data.get("rows"), seed, nx, ny, size, parent)
+        # remember the model's own wording for the terrain codes it used, so the
+        # legend can say "s=沙地·硫磺沙脊" instead of an unexplained "s"
+        self.merge_glossary(_field(data, "terrain_names", "glossary", "terrain_labels",
+                                   default=None))
         norm = {
             "rows": rows,
             "weather": str(data.get("weather", ""))[:20] or "晴",

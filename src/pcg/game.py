@@ -288,6 +288,9 @@ class Game:
         if cmd in ("rules", "patches", "laws"):
             self._show_rules()
             return True
+        if cmd in ("legend", "图例", "symbols"):
+            self._show_legend()
+            return True
         if cmd == "auto":
             n = 10
             if rest:
@@ -370,6 +373,19 @@ class Game:
         for a in rows:
             print(f"  · {a['name']}｜{a['title']}｜{a['description'][:60]}"
                   f"（用过 {a['uses']} 次）")
+
+    def _show_legend(self) -> None:
+        """The full symbol table plus whatever the world calls these terrains."""
+        from .terrain import TERRAIN
+        glossary = self.wm.glossary()
+        print("地形符号（全表）：")
+        for terrain, (symbol, solid, label) in TERRAIN.items():
+            local = glossary.get(symbol) or glossary.get(terrain)
+            extra = f"　本地称「{local}」" if local and local != label else ""
+            print(f"  {symbol} = {label}（{terrain}，{'不可通行' if solid else '可通行'}）{extra}")
+        print("物体/角色符号：o=物体 +=遗迹 %=魔力 b=建筑 v=植物 @=你 汉字=人物 †=尸体")
+        if glossary:
+            print("本世界的地名用词：" + "、".join(f"{k}={v}" for k, v in glossary.items()))
 
     def _show_rules(self) -> None:
         for line in self.rules.describe():
