@@ -18,6 +18,7 @@ from pcg import entities, render  # noqa: E402
 from pcg.config import load_config  # noqa: E402
 from pcg.game import Game  # noqa: E402
 from pcg.sim import sim_state  # noqa: E402
+from pcg.world import LOD_CHUNK  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -189,6 +190,47 @@ class TestCombatDialogue(unittest.TestCase):
         ]})
         ok, why = entities.can_talk(g.store, g.world_id, g.store.get_npc(npc["id"]))
         self.assertTrue(ok, why)
+
+    # ------------------------------------------------------------- co-location
+    def test_npcs_never_step_onto_the_player(self):
+        """Regression: an NPC drifting onto your cell made it look like the
+        character had vanished from the map."""
+        import random
+        g = self.game
+        npc = self.adjacent_npc()
+        g.store.update_npc(npc["id"], x=g.player.x, y=g.player.y + 1)
+        g.store.commit()
+        for _ in range(60):
+            for d in ("w", "s", "d", "a"):
+                g.execute(f"move {d}")
+            for other in g.store.npcs_near(g.world_id, g.player.x, g.player.y, 2, limit=10):
+                self.assertFalse(
+                    other["x"] == g.player.x and other["y"] == g.player.y,
+                    f"{other['name']} is standing on the player at "
+                    f"({other['x']},{other['y']})")
+        del random
+
+    def test_engine_refuses_to_move_an_npc_onto_the_player(self):
+        g = self.game
+        node = g.store.get_node(g.world_id, LOD_CHUNK,
+                                (g.player.x // 16) * 16, (g.player.y // 16) * 16)
+        npc = self.adjacent_npc()
+        g.evolution._apply(3, node, 5, {"changes": [
+            {"type": "npc", "name": npc["name"],
+             "move": [0 if g.player.x == npc["x"] else (1 if g.player.x > npc["x"] else -1),
+                      1 if g.player.y > npc["y"] else -1]},
+        ]})
+        landed = g.store.get_npc(npc["id"])
+        self.assertFalse(landed["x"] == g.player.x and landed["y"] == g.player.y)
+
+    def test_renderer_reports_a_shared_cell_instead_of_hiding_it(self):
+        g = self.game
+        npc = g.store.npcs_near(g.world_id, g.player.x, g.player.y, 40, limit=1)[0]
+        g.store.update_npc(npc["id"], x=g.player.x, y=g.player.y)   # force legacy state
+        g.store.commit()
+        view = render.render_view(g.wm, g.player.x, g.player.y, 16, g.player)
+        self.assertIn("同格", view)
+        self.assertIn(npc["name"], view)
 
     # ------------------------------------------------------------------ sanity
     def test_talk_to_a_named_npc_far_away_reports_distance_not_a_neighbour(self):

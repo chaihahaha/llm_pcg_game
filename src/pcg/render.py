@@ -43,7 +43,12 @@ def render_view(wm, cx: int, cy: int, size: int = 16, player=None) -> str:
     for n in npcs:
         grid[(n["x"], n["y"])] = _npc_char(n) if n.get("alive", 1) else CORPSE_SYM
 
-    if player is not None and player.alive:
+    # Safety net: NPCs are not supposed to share the player's cell (the engine
+    # refuses such moves), but a save written before that rule can still hold
+    # one — and then '@' would silently hide them, so we say so explicitly.
+    sharing = []
+    if player is not None:
+        sharing = [n for n in npcs if n["x"] == player.x and n["y"] == player.y]
         grid[(player.x, player.y)] = "@"
 
     header1 = "    " + "".join(str((x0 + i) // 10 % 10) for i in range(size))
@@ -51,7 +56,11 @@ def render_view(wm, cx: int, cy: int, size: int = 16, player=None) -> str:
     lines = [header1, header2]
     for j in range(size):
         row = "".join(grid.get((x0 + i, y0 + j), "?") for i in range(size))
-        marker = " <-你" if player is not None and y0 + j == player.y else ""
+        marker = ""
+        if player is not None and y0 + j == player.y:
+            marker = " <-你"
+            if sharing:
+                marker += "（同格：" + "、".join(n["name"] for n in sharing) + "）"
         lines.append(f"{y0 + j:4d}{row}{marker}")
 
     lines.append("")

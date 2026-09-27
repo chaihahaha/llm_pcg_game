@@ -18,7 +18,7 @@ to the database.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import prompts
 from .config import cfg_get
@@ -63,6 +63,7 @@ class EvolutionEngine:
         self.distance_scaling = bool(cfg_get(cfg, "evolution.distance_scaling", True))
         # the deterministic substrate runs on every advance, with zero LLM calls
         self.sim = Simulator(store, wm, rules, logger) if rules is not None else None
+        self._player_xy: Optional[Tuple[int, int]] = None
 
     # ------------------------------------------------------------------ tick
     def tick(self) -> int:
@@ -88,6 +89,8 @@ class EvolutionEngine:
         self.store.set_meta("tick", new_tick)
         if not self.enabled:
             return []
+        # while a turn resolves, nothing may step onto the player's cell
+        self._player_xy = (px, py)
         # 1) cheap deterministic continuity: needs, thresholds, decay, spoilage
         sim_events: List[dict] = []
         if self.sim is not None:
@@ -114,6 +117,7 @@ class EvolutionEngine:
         self._npc_drift(px, py, new_tick)
         self.store.prune_events(self.world_id)
         self.store.commit()
+        self._player_xy = None
         return sim_events + produced
 
     def _plan(self, tick: int, px: int, py: int,
@@ -296,6 +300,11 @@ class EvolutionEngine:
                elapsed_hours: int = 0) -> List[dict]:
         if not isinstance(data, dict):
             data = {}
+        # refresh the occupied-cell guard so no delta can park an NPC on the
+        # player, even when _apply is invoked outside a full advance()
+        player_row = self.store.get_player(self.world_id)
+        if player_row:
+            self._player_xy = (int(player_row["x"]), int(player_row["y"]))
         created: List[dict] = []
         summary = str(data.get("summary") or "").strip()
         weather = str(data.get("weather") or "").strip()
@@ -556,7 +565,12 @@ class EvolutionEngine:
         middle of a wood look reachable when the player was walled out.  The
         only allowance: an NPC currently stranded inside impassable terrain may
         step out of it, so legacy saves cannot trap anyone forever.
+
+        The player's own cell is always excluded: two entities on one cell means
+        the renderer draws one over the other and a character "vanishes".
         """
+        if self._player_xy is not None and (x, y) == self._player_xy:
+            return False
         tile = self.store.get_tile(self.world_id, x, y)
         if tile is None:
             return True
@@ -621,6 +635,10 @@ class EvolutionEngine:
                 else:
                     dy = 1 if hash_unit("sy", npc["id"], tick) > 0.5 else -1
             nx, ny = npc["x"] + dx, npc["y"] + dy
+            if (nx, ny) == (px, py):
+                # an NPC must never end up standing on the player: the two would
+                # render at the same cell and the NPC would seem to vanish
+                continue
             if not self._npc_can_enter(npc, nx, ny):
                 continue
             self.store.update_npc(npc["id"], x=nx, y=ny, updated_tick=tick)

@@ -173,7 +173,7 @@ class Simulator:
 
         # --- eat: deterministic foraging for the nearest food -----------------
         if state["hunger"] >= float(self.rules.get("eat_at", 65.0)) and npc.get("alive", 1):
-            ate = self._try_eat(npc, state, tick)
+            ate = self._try_eat(npc, state, tick, px, py)
             if ate:
                 out.append(ate)
 
@@ -228,7 +228,8 @@ class Simulator:
             self.store.update_npc(npc["id"], **patch)
         return out
 
-    def _try_eat(self, npc: dict, state: Dict[str, Any], tick: int) -> Optional[dict]:
+    def _try_eat(self, npc: dict, state: Dict[str, Any], tick: int,
+                 px: int, py: int) -> Optional[dict]:
         """Walk one step toward the nearest food and consume it."""
         foods = [o for o in self.store.objects_near(self.world_id, npc["x"], npc["y"], 4, limit=12)
                  if o.get("kind") in FOOD_KINDS]
@@ -237,7 +238,9 @@ class Simulator:
         target = min(foods, key=lambda o: abs(o["x"] - npc["x"]) + abs(o["y"] - npc["y"]))
         dx = (target["x"] > npc["x"]) - (target["x"] < npc["x"])
         dy = (target["y"] > npc["y"]) - (target["y"] < npc["y"])
-        self.store.update_npc(npc["id"], x=npc["x"] + dx, y=npc["y"] + dy, updated_tick=tick)
+        nx, ny = npc["x"] + dx, npc["y"] + dy
+        if (nx, ny) != (px, py):      # never stand on the player
+            self.store.update_npc(npc["id"], x=nx, y=ny, updated_tick=tick)
         if abs(target["x"] - npc["x"]) + abs(target["y"] - npc["y"]) <= 1:
             state["hunger"] = max(0.0, state["hunger"] - 60.0)
             state["morale"] = min(100.0, state["morale"] + 10.0)
