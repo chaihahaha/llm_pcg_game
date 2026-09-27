@@ -14,7 +14,8 @@ OBJ_SYM = {
     "altar": "&", "corpse": "x", "creature": "c", "object": "o", "feature": "o",
 }
 
-RUBBLE_SYM = "x"  # destroyed objects stay on the map as ruins
+RUBBLE_SYM = "x"     # destroyed objects stay on the map as ruins
+CORPSE_SYM = "†"     # so do the dead, otherwise killing leaves no trace
 
 
 def _npc_char(npc: dict) -> str:
@@ -38,9 +39,9 @@ def render_view(wm, cx: int, cy: int, size: int = 16, player=None) -> str:
         grid[(o["x"], o["y"])] = (OBJ_SYM.get(o.get("kind", "object"), "o")
                                   if o.get("alive", 1) else RUBBLE_SYM)
 
-    npcs = store.npcs_near(world_id, cx, cy, size // 2 + 1, limit=100)
+    npcs = store.npcs_near(world_id, cx, cy, size // 2 + 1, limit=100, alive_only=False)
     for n in npcs:
-        grid[(n["x"], n["y"])] = _npc_char(n)
+        grid[(n["x"], n["y"])] = _npc_char(n) if n.get("alive", 1) else CORPSE_SYM
 
     if player is not None and player.alive:
         grid[(player.x, player.y)] = "@"
@@ -57,7 +58,7 @@ def render_view(wm, cx: int, cy: int, size: int = 16, player=None) -> str:
     lines.append("符号：" + " ".join(f"{v[0]}={k}" for k, v in TERRAIN.items() if k in
                                      ("water", "grass", "tall_grass", "forest", "hill",
                                       "mountain", "ruins", "farm", "road", "arcane")))
-    lines.append("      o=物体 +=遗迹 %=魔力 b=建筑 v=植物 @=你 汉字=人物")
+    lines.append("      o=物体 +=遗迹 %=魔力 b=建筑 v=植物 @=你 汉字=人物 †=尸体")
     if npcs:
         near = sorted(npcs, key=lambda n: abs(n["x"] - cx) + abs(n["y"] - cy))[:6]
         lines.append("附近人物：" + "，".join(
@@ -102,6 +103,12 @@ def render_tile_info(wm, x: int, y: int, describe: bool = True) -> str:
         for n in npcs:
             lines.append(f"  · {n['name']}（{n['race']} {n['role']}，{n['mood']}，"
                          f"HP {n['hp']}/{n['hp_max']}）：{n['personality'] or '看不出情绪。'}")
+    bodies = [n for n in store.npcs_at(world_id, x, y, alive_only=False) if not n.get("alive", 1)]
+    if bodies:
+        lines.append("尸体：")
+        for n in bodies:
+            lines.append(f"  · {n['name']}（{n['race']} {n['role']}，已死）："
+                         f"{(n.get('state') or {}).get('last') or '静静地躺着。'}")
 
     events = store.events_for_player(world_id, x, y, 1, limit=3)
     if events:

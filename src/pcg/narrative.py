@@ -112,6 +112,34 @@ class Narrator:
             lines.append(f"- [{m['kind']}]{about} {m['text']}")
         return "\n".join(lines)
 
+    def stance_digest(self, npc: dict) -> str:
+        """How this NPC feels about the player, spelled out as a constraint.
+
+        Derived from real state (hostility, injuries, the npc->player relation
+        edge and its grudge memories) rather than left for the model to guess.
+        """
+        from .sim import sim_state
+
+        sim = sim_state(npc)
+        bits = []
+        if npc.get("hostile"):
+            bits.append("敌视（已经对你动过手）")
+        rel = [r for r in self.store.relations_for(self.world_id, "npc", npc["name"], limit=6)
+               if r["other_kind"] == "player"]
+        if rel:
+            r = rel[0]
+            bits.append(f"与你的关系：{r['kind']}({r['value']})")
+        grudges = [m for m in self.store.npc_memories(npc["id"], limit=8, kinds=["grudge"])]
+        if grudges:
+            bits.append("你记得他做过：" + "；".join(m["text"][:40] for m in grudges[:2]))
+        hp, hp_max = int(npc["hp"]), int(npc["hp_max"]) or 1
+        if hp < hp_max:
+            bits.append(f"你身上有伤（HP {hp}/{hp_max}，伤口还在疼）")
+        bits.append(f"当前情绪：{npc.get('mood', '平静')}")
+        bits.append(f"需求：饥饿{sim['hunger']:.0f} 疲惫{sim['fatigue']:.0f} "
+                    f"愤怒{sim['anger']:.0f} 士气{sim['morale']:.0f}")
+        return "；".join(bits)
+
     def npc_history_digest(self, npc: dict, limit: int = 3) -> str:
         """What this NPC actually lived through, straight from the event log.
 
@@ -141,10 +169,17 @@ class Narrator:
                             if quest else ""),
             memories=self.npc_memory_digest(npc),
             relations=self.npc_relation_digest(npc),
-            npc_history=self.npc_history_digest(npc))
+            npc_history=self.npc_history_digest(npc),
+            stance=self.stance_digest(npc))
         msgs = prompts.build(self.wm.world_bible(), text)
         data = self.llm.json(msgs, task="dialogue", default={})
         reply = str(data.get("reply") or "……").strip()
+        attacked = str(data.get("action") or "") == "attack"
+        if attacked and npc.get("alive", 1):
+            # the model chose violence: make it real, not decorative
+            dmg = max(1, int(npc["atk"]) - int(player.data["def"]) + 1)
+            player.damage(dmg)
+            reply = reply or f"{npc['name']}不再多言，直接动了手。"
         # the world's own laws (and any patch) get the last word on speech
         if self.rules is not None:
             hooked = self.rules.call("speech", {"npc": npc["name"], "reply": reply,

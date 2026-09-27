@@ -151,6 +151,42 @@ def _apply_one(ctx: EffectContext, eff: Dict[str, Any]) -> Optional[str]:
     if op in ("damage_player", "heal_player", "damage_npc", "heal_npc"):
         return _vital(ctx, op, eff)
 
+    if op == "set_npc":
+        # pacify / enrage / change demeanour — the player-facing escape hatch
+        # from a state that would otherwise gate all conversation
+        name = str(eff.get("name") or eff.get("npc") or "").strip()
+        npc = store.find_npc_by_name(wid, name) if name else None
+        if not npc:
+            return None
+        from .sim import sim_state
+        sim = sim_state(npc)
+        for src, dst in (("anger", "anger"), ("morale", "morale"), ("hunger", "hunger"),
+                         ("fatigue", "fatigue")):
+            if isinstance(eff.get(src), (int, float)):
+                sim[dst] = max(0.0, min(100.0, float(eff[src])))
+        state = dict(npc.get("state") or {})
+        state["sim"] = sim
+        patch: Dict[str, Any] = {"state": state, "updated_tick": ctx.tick}
+        if eff.get("hostile") is not None:
+            patch["hostile"] = 1 if eff["hostile"] else 0
+        for field, limit in (("mood", 16), ("status", 24)):
+            value = str(eff.get(field, "")).strip()
+            if value:
+                patch[field] = value[:limit]
+        if isinstance(eff.get("hp"), (int, float)):
+            patch["hp"] = max(0, min(int(npc["hp_max"]), int(eff["hp"])))
+            if patch["hp"] == 0:
+                patch["alive"] = 0
+        if isinstance(eff.get("relation_value"), (int, float)):
+            store.upsert_relation(wid, "npc", npc["name"], "player",
+                                  str(eff.get("player", "旅人")),
+                                  kind=str(eff.get("relation_kind", "中立"))[:16],
+                                  value=int(eff["relation_value"]),
+                                  note=str(eff.get("note", ""))[:160], tick=ctx.tick)
+        store.update_npc(npc["id"], **patch)
+        store.commit()
+        return f"{npc['name']} 的状态改变了"
+
     if op == "grant":
         item = str(eff.get("item", "")).strip()[:30]
         if not item or ctx.player is None:

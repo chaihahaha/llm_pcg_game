@@ -140,18 +140,143 @@ def can_enter(store: Store, world_id: int, x: int, y: int, rules=None) -> Tuple[
     return True, ""
 
 
-def find_npc(store: Store, world_id: int, name: str, x: int, y: int, radius: int = 2) -> Optional[dict]:
+def record_aggression(store: Store, world_id: int, attacker: str, npc: dict, damage: int,
+                      tick: int) -> None:
+    """Being hurt is a *fact about the world*, not just a number on a bar.
+
+    Without this, combat and conversation were disconnected: you could stab
+    someone and they would happily chat on the next line.  Getting hit now
+    raises anger, lowers morale, turns the NPC hostile, writes a grudge into its
+    long-term memory and marks the relationship as blood-feud — all of which the
+    simulation, the dialogue prompt and future evolution steps then read.
+    """
+    from .sim import sim_state
+
+    state = dict(npc.get("state") or {})
+    sim = sim_state(npc)
+    sim["anger"] = min(100.0, float(sim.get("anger", 0.0)) + 35.0)
+    sim["morale"] = max(0.0, float(sim.get("morale", 50.0)) - 10.0)
+    sim["grudge_tick"] = tick
+    state["sim"] = sim
+    state["last"] = f"被{attacker}砍伤（-{damage}），怒火中烧。"
+    patch: dict = {"hostile": 1, "state": state, "updated_tick": tick}
+    if not npc.get("alive", 1):
+        patch["alive"] = 0
+    store.update_npc(npc["id"], **patch)
+    store.add_memory(world_id, npc["id"], tick, "grudge",
+                     f"{attacker}袭击了我（-{damage} 点血）。我记住了。", about=attacker)
+    store.upsert_relation(world_id, "npc", npc["name"], "player", attacker,
+                          kind="死敌", value=-5, note=f"被{attacker}砍伤", tick=tick)
+    store.prune_memories(npc["id"], keep=24)
+    store.commit()
+
+
+_TALK_BLOCKED = {"昏睡", "昏迷", "重伤昏迷", "死亡", "已逝", "被缚", "被俘"}
+
+
+def can_talk(store: Store, world_id: int, npc: dict) -> Tuple[bool, str]:
+    """May this NPC hold a conversation right now?  Returns (ok, reason-code)."""
+    from .sim import sim_state
+
+    if not npc.get("alive", 1) or int(npc.get("hp", 0)) <= 0:
+        return False, "dead"
+    sim = sim_state(npc)
+    if str(sim.get("condition") or "") in _TALK_BLOCKED or str(npc.get("status") or "") in _TALK_BLOCKED:
+        return False, "unconscious"
+    if npc.get("hostile") and (int(npc["hp"]) < int(npc["hp_max"]) or float(sim.get("anger", 0)) >= 60):
+        return False, "hostile"
+    return True, ""
+
+
+def find_npc(store: Store, world_id: int, name: str, x: int, y: int, radius: int = 2,
+             include_dead: bool = True) -> Optional[dict]:
+    """Locate a target for talk/attack.
+
+    Dead NPCs are included on purpose: "there is nobody here" is a lie when the
+    corpse of the person you named is lying at your feet, and it hides the real
+    reason (they are dead) from the player.
+    """
+    reachable = lambda n: abs(n["x"] - x) + abs(n["y"] - y) <= radius  # noqa: E731
+
     if name:
         npc = store.find_npc_by_name(world_id, name)
-        if npc:
+        if npc and reachable(npc):
             return npc
+        if include_dead:
+            for n in store.list_npcs(world_id, alive_only=False):
+                if n["name"] == name and reachable(n):
+                    return n
+        # A named target that exists but is out of reach must NOT be returned:
+        # letting the caller act at any distance made "talk <name>" global and
+        # made the distance message unreachable.
+        if npc is not None or any(n["name"] == name
+                                  for n in store.list_npcs(world_id, alive_only=False)):
+            return None
+    # no name given: prefer a living neighbour, only fall back to a body
     here = store.npcs_at(world_id, x, y)
     if here:
         return here[0]
     near = store.npcs_near(world_id, x, y, radius)
     if near:
         return near[0]
+    if include_dead:
+        bodies = store.npcs_at(world_id, x, y, alive_only=False)
+        if bodies:
+            return bodies[0]
+        near_bodies = store.npcs_near(world_id, x, y, radius, alive_only=False)
+        if near_bodies:
+            return near_bodies[0]
     return None
+
+
+def witness_violence(store: Store, world_id: int, killer: str, victim: dict, tick: int,
+                     radius: int = 6) -> list:
+    """Bystanders react to a killing — societies should not ignore murder.
+
+    Deterministic and relation-driven: someone who liked the victim turns
+    hostile; someone who disliked them is quietly pleased; strangers just
+    remember it and grow warier.
+    """
+    from .sim import sim_state
+
+    reactions: list = []
+    for other in store.npcs_near(world_id, victim["x"], victim["y"], radius, limit=8):
+        if other["id"] == victim["id"]:
+            continue
+        rel = [r for r in store.relations_for(world_id, "npc", other["name"], limit=8)
+               if r["other_kind"] == "npc" and r["other_name"] == victim["name"]]
+        value = int(rel[0]["value"]) if rel else 0
+        state = dict(other.get("state") or {})
+        sim = sim_state(other)
+        patch = {}
+        if value > 0:
+            sim["anger"] = min(100.0, float(sim.get("anger", 0)) + 30.0)
+            sim["morale"] = max(0.0, float(sim.get("morale", 50)) - 10.0)
+            patch["hostile"] = 1
+            note = f"{killer}杀了{victim['name']}，而我和他有交情。"
+            text = f"{killer}杀了{victim['name']}。我亲眼看见，这事没完。"
+            reactions.append(f"{other['name']}目睹{killer}杀了他的熟人，转为敌对")
+        elif value < 0:
+            sim["morale"] = min(100.0, float(sim.get("morale", 50)) + 8.0)
+            note = f"{victim['name']}死了，我不难过。"
+            text = f"{victim['name']}终于死了，我早就盼着这一天。"
+            reactions.append(f"{other['name']}对{victim['name']}的死幸灾乐祸")
+        else:
+            sim["anger"] = min(100.0, float(sim.get("anger", 0)) + 10.0)
+            note = f"{killer}在我眼前杀了人。"
+            text = f"{killer}在我面前杀了{victim['name']}。这样的人得离远点。"
+            reactions.append(f"{other['name']}目睹了{killer}杀人，心生戒备")
+        state["sim"] = sim
+        state["last"] = note
+        patch["state"] = state
+        patch["updated_tick"] = tick
+        store.update_npc(other["id"], **patch)
+        store.add_memory(world_id, other["id"], tick, "fact", text, about=killer)
+        store.prune_memories(other["id"], keep=24)
+        store.add_event(world_id, tick, 3, other.get("node_id"), other["x"], other["y"],
+                        "conflict", f"{other['name']}目睹{killer}杀死{victim['name']}")
+    store.commit()
+    return reactions
 
 
 # ---------------------------------------------------------------------- combat
@@ -184,6 +309,8 @@ def attack(store: Store, world_id: int, player: Player, npc: dict, tick: int,
     killed = npc_hp <= 0
     if killed:
         store.update_npc(npc["id"], hp=0, alive=0, updated_tick=tick)
+        store.add_memory(world_id, npc["id"], tick, "grudge",
+                         f"{player.data.get('name','你')}杀死了我。", about=player.data.get("name", ""))
         log.append(f"{npc['name']} 倒下了。")
         xp = 5 + hash_int("xp", npc["id"], mod=8)
         log.extend(player.gain_xp(xp))
@@ -194,8 +321,11 @@ def attack(store: Store, world_id: int, player: Player, npc: dict, tick: int,
             log.append(f"你搜到了 {gold} 枚硬币。")
         store.add_event(world_id, tick, 3, npc.get("node_id"), npc["x"], npc["y"], "combat",
                         f"玩家击败了{npc['name']}（{npc.get('role','')}）")
+        for line in witness_violence(store, world_id, player.data.get("name", "你"), npc, tick):
+            log.append("※ " + line)
     else:
-        store.update_npc(npc["id"], hp=npc_hp, hostile=1, updated_tick=tick)
+        store.update_npc(npc["id"], hp=npc_hp, updated_tick=tick)
+        record_aggression(store, world_id, player.data.get("name", "你"), npc, dmg, tick)
         if hash_unit(seed_key + ("ret",)) < 0.75:
             back = max(1, int(npc["atk"]) + _roll(seed_key + ("n",), 0, 2) - int(player.data["def"]))
             player.damage(back)

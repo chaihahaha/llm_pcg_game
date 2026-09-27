@@ -21,10 +21,16 @@ from .llm import LLMClient
 from .narrative import Narrator
 from .rng import hash_int
 from .rules import RuntimeRules
+from .sim import sim_state
 from .tokens import sanitize_text
 from .world import LOD_CHUNK, WorldManager
 
 _DIRS = ["w", "a", "s", "d", "n", "e", "s", "w"]
+
+# commands that make sense while unconscious
+_PASSIVE_COMMANDS = {"look", "l", "stats", "journal", "story", "world", "help", "h", "?",
+                     "rules", "patches", "laws", "actions", "acts", "inspect", "i", "x",
+                     "quit", "exit", "q"}
 
 
 def _setup_logger(verbose: bool = False) -> logging.Logger:
@@ -205,6 +211,9 @@ class Game:
 
         if cmd in ("quit", "exit", "q"):
             return False
+        if self.player is not None and not self.player.alive and cmd not in _PASSIVE_COMMANDS:
+            print("你已经倒下了，无法行动。输入 quit 退出，或查看 stats / journal。")
+            return True
         if cmd in ("help", "h", "?"):
             print(render.render_help())
             return True
@@ -448,19 +457,29 @@ class Game:
         name, line = "", rest
         tokens = rest.split(maxsplit=1)
         if tokens:
-            near = self.store.npcs_at(self.world_id, self.player.x, self.player.y)
-            if not near:
-                near = self.store.npcs_near(self.world_id, self.player.x, self.player.y, 2)
-            if any(n["name"] == tokens[0] for n in near):
-                name = tokens[0]
+            # If the first word names *anyone* in the world, it is the target —
+            # even if they are far away or dead.  Matching only against nearby
+            # NPCs silently dropped the name and made you address the corpse
+            # lying next to you instead of the person you asked for.
+            candidate = tokens[0]
+            if self.store.find_npc_by_name(self.world_id, candidate) or \
+                    any(n["name"] == candidate
+                        for n in self.store.list_npcs(self.world_id, alive_only=False)):
+                name = candidate
                 line = tokens[1] if len(tokens) > 1 else ""
         npc = self._npc_target(name, verb="交谈")
         if not npc:
+            return
+        ok, why = entities.can_talk(self.store, self.world_id, npc)
+        if not ok:
+            self._refuse_talk(npc, why)
             return
         if not line:
             line = "你好。"
         result = self.narrator.talk(self.player, npc, line)
         print(f"{npc['name']}：{result['reply']}")
+        if result.get("attacked"):
+            print(f"※ {npc['name']}动了手！你受到伤害（HP {self.player.hp}/{self.player.data['hp_max']}）")
         if result.get("mood"):
             print(f"（{npc['name']}现在 {result['mood']}）")
         if result.get("quest"):
@@ -484,6 +503,32 @@ class Game:
                 print(f"…{flavor}")
         if not self.player.alive:
             print("你倒下了。世界仍在运转……")
+        print(self.draw())
+
+    def _refuse_talk(self, npc: dict, why: str) -> None:
+        """Conversation is gated on state, not left to the model's goodwill.
+
+        The model is willing to befriend whoever you just stabbed, so combat and
+        dialogue have to be wired together deterministically; the LLM only
+        narrates cases that are actually talkable.
+        """
+        assert self.player is not None
+        if why == "dead":
+            print(f"{npc['name']}已经死了，不会回答你。")
+            return
+        if why == "unconscious":
+            cond = npc.get("status") or "失去意识"
+            print(f"{npc['name']}（{cond}）无法回应。")
+            return
+        # hostile
+        sim = sim_state(npc)
+        print(f"{npc['name']}没有回答——他握着武器，血从伤口往下淌"
+              f"（HP {npc['hp']}/{npc['hp_max']}，怒气{sim['anger']:.0f}）。"
+              "想让他开口，先想办法让他冷静下来。")
+        for line in entities.npc_turn(self.store, self.world_id, npc,
+                                      self.player.x, self.player.y, self.tick()):
+            print(line)
+        self.player.refresh()
         print(self.draw())
 
     def _npc_target(self, name: str, verb: str = "交谈"):
@@ -514,8 +559,14 @@ class Game:
         return None
 
     def _resolve_npc_turn(self) -> None:
+        """Hostile neighbours get their turn.
+
+        This used to scan only the player's own tile — but movement refuses to
+        enter an occupied tile, so that set was always empty and NPCs could
+        never retaliate.  Adjacency (radius 1) is the correct neighbourhood.
+        """
         assert self.player is not None
-        for npc in self.store.npcs_at(self.world_id, self.player.x, self.player.y):
+        for npc in self.store.npcs_near(self.world_id, self.player.x, self.player.y, 1, limit=8):
             for line in entities.npc_turn(self.store, self.world_id, npc,
                                           self.player.x, self.player.y, self.tick()):
                 print(line)

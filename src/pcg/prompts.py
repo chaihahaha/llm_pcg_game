@@ -228,7 +228,8 @@ def evolve_task(lod_name: str, seed: int, scope_desc: str, local_digest: str,
 
 def dialogue_task(seed: int, npc: Dict[str, Any], world_brief: str, place: str,
                   local_events: str, history: str, player_line: str, quest: str,
-                  memories: str = "", relations: str = "", npc_history: str = "") -> str:
+                  memories: str = "", relations: str = "", npc_history: str = "",
+                  stance: str = "") -> str:
     return (
         f"[[TASK:dialogue]][[NPC:{npc.get('name','')}]][[SEED:{seed}]]\n"
         f"你扮演 NPC「{npc.get('name','')}」，{npc.get('race','')}，{npc.get('role','')}，"
@@ -242,12 +243,15 @@ def dialogue_task(seed: int, npc: Dict[str, Any], world_brief: str, place: str,
         f"当地近期传闻：{local_events or '无'}\n"
         f"你记得的事（这是你的长期记忆，必须与之一致，不得遗忘或否认）：{memories or '（暂无）'}\n"
         f"你的人际关系（必须保持一致，可流露态度）：{relations or '（暂无）'}\n"
-        f"你们之前的对话：\n{history or '（初次见面）'}\n"
+        + (f"你对玩家的态度（必须严格遵守）：{stance}\n" if stance else "")
+        + f"你们之前的对话：\n{history or '（初次见面）'}\n"
         f"玩家说：{player_line}\n"
         f"玩家当前任务：{quest or '暂无'}\n"
         "用 NPC 的口吻回答（1-3 句，符合身份、性格与当地见闻，可以夹带线索或提出请求）。"
         "绝不能与上述记忆、亲历之事或先前对话矛盾；不要编造未记录的外貌特征，"
-        "不要给出与记录不符的人数/伤亡数字；若玩家问到你不知道的事，就承认不知道。输出 JSON："
+        "不要给出与记录不符的人数/伤亡数字；若玩家问到你不知道的事，就承认不知道。"
+        "若态度是敌视/厌恶，你不可能与玩家寒暄或帮忙；回答只能是威胁、咒骂、驱赶，"
+        "或直接动手（action=attack）。输出 JSON："
         '{"reply":"NPC说的话","mood":"回答后NPC的情绪","action":"none|quest|trade|attack|info",'
         '"action_data":{"quest_title":"当 action=quest 时给出","quest_summary":"任务概要"},'
         '"memories":[{"kind":"fact|promise|grudge|debt|goal","about":"涉及的人或地","text":"本次对话后你会记住的新事"}],'
@@ -296,6 +300,9 @@ EFFECT_OPS_DOC = (
     '{"op":"damage_player","amount":1-50}{"op":"heal_player","amount":1-50}\n'
     '{"op":"damage_npc","npc":"名字","amount":1-50}{"op":"heal_npc","npc":"名字","amount":1-50}\n'
     '{"op":"grant","item":"物品名","qty":1-20}  放入玩家背包\n'
+    '{"op":"set_npc","name":"名字","hostile":0或1,"mood":"情绪","status":"处境",'
+    '"anger":0-100,"morale":0-100,"hp":整数,"relation_value":-5到5,"relation_kind":"死敌|相识|盟友",'
+    '"note":"原因"}  改变某人的态度/伤势（用于安抚、威吓、治疗）\n'
     '{"op":"set_weather","text":"天气"}\n'
     '{"op":"event","kind":"discovery|conflict|magic|economy|weather","text":"发生了什么"}\n'
     '{"op":"memory","npc":"名字","kind":"fact|promise|grudge|debt|goal","about":"人或地","text":"记住的事"}\n'

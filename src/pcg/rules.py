@@ -37,6 +37,7 @@ DEFAULTS: Dict[str, Any] = {
     "hunger_rate": 4.0,             # need gained per 24h
     "fatigue_rate": 6.0,
     "anger_rate": 0.5,
+    "hostility_cool_hours": 168,   # how long a grudge keeps an NPC hostile
     "morale_rate": 3.0,             # morale lost per 24h
     "eat_at": 65.0,                 # hunger at which an NPC forages
     "starve_at": 90.0,              # hunger at which HP starts dropping
@@ -78,7 +79,7 @@ _RULE_BOUNDS = {
     "heal_multiplier": (0.0, 20.0),
     "action_cost_multiplier": (0.0, 50.0),
     "hunger_rate": (0.0, 50.0), "fatigue_rate": (0.0, 50.0), "morale_rate": (0.0, 50.0),
-    "anger_rate": (0.0, 50.0),
+    "anger_rate": (0.0, 50.0), "hostility_cool_hours": (0, 8760),
     "eat_at": (0.0, 100.0), "starve_at": (0.0, 100.0), "anger_attack_at": (0.0, 100.0),
     "starve_hp_loss": (0.0, 10.0),
     "mood_override_hours": (0, 240),

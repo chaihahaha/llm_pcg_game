@@ -186,6 +186,21 @@ class Simulator:
                 out.append(self._event(tick, npc, "conflict",
                                        f"{npc['name']}的怒气再也压不住，向附近的人扑了上去"))
 
+        # --- hostility cools down: anger decays, and an NPC that has calmed
+        #     down (or been healed) stops treating the player as an enemy
+        if npc.get("hostile") and npc.get("alive", 1):
+            grudge_age = tick - int(state.get("grudge_tick", -10 ** 9))
+            if state["anger"] <= 20.0 and hp >= max(1, int(npc["hp_max"]) // 2) \
+                    and grudge_age >= int(self.rules.get("hostility_cool_hours", 168)):
+                patch["hostile"] = 0
+                state["grudge_tick"] = -10 ** 9
+                out.append(self._event(tick, npc, "sim",
+                                       f"{npc['name']}的怒气消了，不再主动动手"))
+            elif state["anger"] < 45.0 and grudge_age >= 24 * 30:
+                patch["hostile"] = 0
+                out.append(self._event(tick, npc, "sim",
+                                       f"{npc['name']}不再记恨那件事了"))
+
         # --- collapse / resolve ----------------------------------------------
         if npc.get("alive", 1) and state["fatigue"] >= 95.0 and state["condition"] != "昏睡":
             state["condition"] = "昏睡"
